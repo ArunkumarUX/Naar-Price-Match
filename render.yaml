@@ -3,7 +3,7 @@ services:
     name: naar-api
     runtime: node
     plan: free
-    buildCommand: npm install && npx prisma migrate resolve --rolled-back "0_init"; npm run migrate:deploy
+    buildCommand: npm install --include=dev && npx prisma migrate resolve --rolled-back "0_init"; npm run migrate:deploy
     startCommand: npm start
     envVars:
       - key: NODE_ENV
