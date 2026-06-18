@@ -2,7 +2,7 @@ services:
   - type: web
     name: naar-api
     runtime: node
-    plan: starter
+    plan: free
     buildCommand: npm install && npm run migrate:deploy
     startCommand: npm start
     envVars:
@@ -29,7 +29,7 @@ services:
   - type: worker
     name: naar-worker
     runtime: node
-    plan: starter
+    plan: free
     buildCommand: npm install
     startCommand: npm run worker
     envVars:
@@ -49,9 +49,9 @@ services:
 
   - type: redis
     name: naar-redis
-    plan: starter
+    plan: free
     ipAllowList: []
 
 databases:
   - name: naar-db
-    plan: starter
+    plan: free
