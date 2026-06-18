@@ -1,0 +1,570 @@
+[
+  {
+    "id": "S001",
+    "store_name": "Women's world boutique",
+    "business_name": "Baby subramaniam",
+    "website": "https://womensworldboutique.in",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S002",
+    "store_name": "SAREE STORY WITH SHANMUGAPRIYA",
+    "business_name": "PUVIARASU SHANMUGA PRIYA",
+    "website": "https://travelstorycollectives.com",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S003",
+    "store_name": "HAPPY PIQUE",
+    "business_name": "AKSHAYA KRISHNAKUMAR",
+    "website": "https://happypique.in",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S004",
+    "store_name": "Thambulaaa return gifts",
+    "business_name": "LATHA U",
+    "website": "https://thambulaaareturngifts.com",
+    "category": "Home Essentials",
+    "active": true
+  },
+  {
+    "id": "S005",
+    "store_name": "CO-OPTEX",
+    "business_name": "THE TN HANDLOOM WEAVERS",
+    "website": "https://cooptex.com/home",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S006",
+    "store_name": "Goodness farm",
+    "business_name": "Maria Jenita",
+    "website": "https://www.goodness-farm.com",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S007",
+    "store_name": "LYE & COCO",
+    "business_name": "S SURESH",
+    "website": "https://lye.ueniweb.com",
+    "category": "Beauty",
+    "active": true
+  },
+  {
+    "id": "S008",
+    "store_name": "VRIKSHA Healthy Eats",
+    "business_name": "Padmavathy Mahesh",
+    "website": "https://vrikshahealthyeats.blogspot.com",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S009",
+    "store_name": "NALAM HEALTH CARE",
+    "business_name": "KAVITHA",
+    "website": "https://nalamhealthcare.in",
+    "category": "Health",
+    "active": true
+  },
+  {
+    "id": "S010",
+    "store_name": "LAKSHMI AACHI CHETTINAD SNACKS",
+    "business_name": "LAKSHMI AACHI CHETTINAD SNACKS",
+    "website": "https://www.lakshmiaachi.com",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S011",
+    "store_name": "Sirpika millets",
+    "business_name": "BHARANIDHARAN VIDHYA",
+    "website": "https://sirpikamillets.com",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S012",
+    "store_name": "ALT Fashions",
+    "business_name": "PRAKASH N",
+    "website": "https://altfashions.com",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S013",
+    "store_name": "NUTRI UNIQ",
+    "business_name": "GOMATHY S",
+    "website": "https://www.nutriuniq.in",
+    "category": "Beauty",
+    "active": true
+  },
+  {
+    "id": "S014",
+    "store_name": "Nuttin But Love",
+    "business_name": "Suraj",
+    "website": "https://www.nuttinbutlove.in",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S015",
+    "store_name": "ESSOR SUPERFOODS PRIVATE LIMITED",
+    "business_name": "ESSOR SUPERFOODS PRIVATE LIMITED",
+    "website": "https://essorsuperfoods.com",
+    "category": "Health",
+    "active": true
+  },
+  {
+    "id": "S016",
+    "store_name": "Wysh Lyst",
+    "business_name": "RASHMI",
+    "website": "https://wyshlist.io",
+    "category": "Toys & Baby",
+    "active": true
+  },
+  {
+    "id": "S017",
+    "store_name": "Grindhaus",
+    "business_name": "GALACTIC GOURMET GRUB LLP",
+    "website": "https://www.mygrindhaus.com",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S018",
+    "store_name": "Miracle Enzyme",
+    "business_name": "Vasudha Binjani",
+    "website": "https://www.miracleenzyme.in",
+    "category": "Home Essentials",
+    "active": true
+  },
+  {
+    "id": "S019",
+    "store_name": "Fluffy Munchkin",
+    "business_name": "ASOKAN MARYLYDIA",
+    "website": "https://thefluffymunchkin.com",
+    "category": "Kids",
+    "active": true
+  },
+  {
+    "id": "S020",
+    "store_name": "Thaazhai",
+    "business_name": "vishnu praba G",
+    "website": "https://www.thaazhai.com",
+    "category": "Beauty",
+    "active": true
+  },
+  {
+    "id": "S021",
+    "store_name": "Selli Handcrafts",
+    "business_name": "RAMASAMY GOPALAKRISHNAN",
+    "website": "https://www.sellibuy.in",
+    "category": "Home Essentials",
+    "active": true
+  },
+  {
+    "id": "S022",
+    "store_name": "MIND EYE JEWELLERY",
+    "business_name": "HEENAL MAHAVEER RANKA",
+    "website": "https://houseofmindeye.com",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S023",
+    "store_name": "Anokhi Jewellery",
+    "business_name": "Monica",
+    "website": "https://anokhijewellery.in",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S024",
+    "store_name": "THE PLUSH STORY",
+    "business_name": "THE PLUSH STORY",
+    "website": "https://theplushstory.com",
+    "category": "Kids",
+    "active": true
+  },
+  {
+    "id": "S025",
+    "store_name": "PARUTHEE HANDLOOM CLOTHING.CO",
+    "business_name": "JALAPATHY SURENDHARAN",
+    "website": "https://paruthee.com",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S026",
+    "store_name": "Paper Flower",
+    "business_name": "VINATHAHARI",
+    "website": "https://paperflower.in",
+    "category": "Home Essentials",
+    "active": true
+  },
+  {
+    "id": "S027",
+    "store_name": "PappuDaddu Healthy Foods",
+    "business_name": "SARAVANAN SULOCHANA",
+    "website": "https://pappudaddu.com",
+    "category": "Beauty",
+    "active": true
+  },
+  {
+    "id": "S028",
+    "store_name": "Seethal Studio",
+    "business_name": "USHA SEETHAPATHY",
+    "website": "https://seethalstudio.com",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S029",
+    "store_name": "Alangrahaa",
+    "business_name": "KRISHNASWAMY ANITHA",
+    "website": "https://alangrahaa.com",
+    "category": "Home Essentials",
+    "active": true
+  },
+  {
+    "id": "S030",
+    "store_name": "KONGU VIRUNDHU Ready To Cook",
+    "business_name": "S SENTHILPRABHU",
+    "website": "https://konguvirundhu.com",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S031",
+    "store_name": "khetii",
+    "business_name": "RUCHI DHADDA",
+    "website": "http://khetiibyruchi.in",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S032",
+    "store_name": "The Camel Bar",
+    "business_name": "TCB WELLNESS PRIVATE LIMITED",
+    "website": "https://www.thecamelbar.com",
+    "category": "Beauty",
+    "active": true
+  },
+  {
+    "id": "S033",
+    "store_name": "Blingo Jewelry",
+    "business_name": "SHRADHA BAFNA",
+    "website": "https://www.facebook.com/Blingoshopping/",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S034",
+    "store_name": "Mudpie Pottery",
+    "business_name": "PERIAKARUPPAN ANNAMALAI UNNAMALAI",
+    "website": "https://www.mudpiepottery.in",
+    "category": "Home Essentials",
+    "active": true
+  },
+  {
+    "id": "S035",
+    "store_name": "Potent O' Herbs",
+    "business_name": "SRINIVASAN PRIYADHARSHINI",
+    "website": "https://www.potentoherbscosmetics.com",
+    "category": "Beauty",
+    "active": true
+  },
+  {
+    "id": "S036",
+    "store_name": "CHITTAM PRIVATE LIMITED",
+    "business_name": "CHITTAM PRIVATE LIMITED",
+    "website": "https://chittam.in",
+    "category": "Toys & Baby",
+    "active": true
+  },
+  {
+    "id": "S037",
+    "store_name": "Vishara",
+    "business_name": "SHARANYA",
+    "website": "https://www.vishara.in",
+    "category": "Beauty",
+    "active": true
+  },
+  {
+    "id": "S038",
+    "store_name": "Nivarana",
+    "business_name": "OZONIV PRIVATE LIMITED",
+    "website": "https://nivarana.org",
+    "category": "Beauty",
+    "active": true
+  },
+  {
+    "id": "S039",
+    "store_name": "AR FOOD PRODUCTS",
+    "business_name": "GUTTULA GIRISKUMAR",
+    "website": "https://www.arfoods.co.in",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S040",
+    "store_name": "Kamarkattu ecostore",
+    "business_name": "RAJAMANICKAM MANIMOZHI",
+    "website": "https://kamarkattuecostore.co.in",
+    "category": "Beauty",
+    "active": true
+  },
+  {
+    "id": "S041",
+    "store_name": "Malli",
+    "business_name": "Poornima Bhavesh Joshi",
+    "website": "https://www.nadhi.life/collections/malli-safe-culinary-collection",
+    "category": "Home Essentials",
+    "active": true
+  },
+  {
+    "id": "S042",
+    "store_name": "Kasang",
+    "business_name": "ARAVINDH NATESAN",
+    "website": "https://www.kasang.store",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S043",
+    "store_name": "SR FOOD PRODUCTS",
+    "business_name": "SR FOOD PRODUCTS",
+    "website": "https://srfoodproducts.com",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S044",
+    "store_name": "SHA'S ATTAR and PERFUMES",
+    "business_name": "Mohamed Thamby",
+    "website": "https://shasattarandperfumes.com",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S045",
+    "store_name": "Aran (HMR Healthy Food Product)",
+    "business_name": "MOHAMED IBRAHIM MOHAMED FAROOK",
+    "website": "https://www.aranonline.com",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S046",
+    "store_name": "Narpavihoney Narpavi",
+    "business_name": "SANTHANA SARASWATHI",
+    "website": "https://www.narpavihoney.com",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S047",
+    "store_name": "Narchuvai Foods",
+    "business_name": "ANUSHA",
+    "website": "http://narchuvaifoods.in",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S048",
+    "store_name": "ANAIRA",
+    "business_name": "ANAIRA",
+    "website": "https://labelanaira.com",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S049",
+    "store_name": "ELANOR COSMETICS",
+    "business_name": "ELANOR COSMETICS PRIVATE LIMITED",
+    "website": "https://www.elanorcosmetics.com",
+    "category": "Beauty",
+    "active": true
+  },
+  {
+    "id": "S050",
+    "store_name": "Darshitam",
+    "business_name": "B Sarenya Dhevi",
+    "website": "https://www.darshitam.com",
+    "category": "Home Essentials",
+    "active": true
+  },
+  {
+    "id": "S051",
+    "store_name": "THY CHOCOLATES",
+    "business_name": "PRAHANA PRODUCTS PRIVATE LIMITED",
+    "website": "https://www.thychocolates.com",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S052",
+    "store_name": "Ruya Ayurveda",
+    "business_name": "SACRED ROOTS OF AYURVEDA",
+    "website": "https://www.ruyaayurveda.com",
+    "category": "Beauty",
+    "active": true
+  },
+  {
+    "id": "S053",
+    "store_name": "EMAS",
+    "business_name": "SURYA PRATHAPAN",
+    "website": "http://myemas.in/contact",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S054",
+    "store_name": "Mommade.co",
+    "business_name": "Priyadharshini k",
+    "website": "https://mommade.co",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S055",
+    "store_name": "Mellow Feast Chocolates",
+    "business_name": "Charan Narra",
+    "website": "https://mellowfeastchocolates.myshopify.com",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S056",
+    "store_name": "THAENVEEDU Raw Forest Honey",
+    "business_name": "J BHUVANESH",
+    "website": "https://www.thaenveeduforesthoney.com",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S057",
+    "store_name": "Eco Charm",
+    "business_name": "L SUGANTHI",
+    "website": "https://ecocharm.in",
+    "category": "Beauty",
+    "active": true
+  },
+  {
+    "id": "S058",
+    "store_name": "Einiyaa Homemade",
+    "business_name": "LAKSHMI",
+    "website": "https://einiyaaproducts.com",
+    "category": "Beauty",
+    "active": true
+  },
+  {
+    "id": "S059",
+    "store_name": "Kaaram OK Please",
+    "business_name": "SAUCIER FOODS PRIVATE LIMITED",
+    "website": "https://kaaramokplease.com",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S060",
+    "store_name": "Sree VPR Textile Sree VPR Textile",
+    "business_name": "RAJALAKSHMI",
+    "website": "https://sreevprtextile.com",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S061",
+    "store_name": "Cavasa",
+    "business_name": "HARSHAA",
+    "website": "https://www.cavasa.in",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S062",
+    "store_name": "Shivas Pickle",
+    "business_name": "V PADMAPRIYA",
+    "website": "https://shivapickles.com",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S063",
+    "store_name": "Gokulnath Natesan",
+    "business_name": "Gokulnath Natesan",
+    "website": "https://www.kazhani.in",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S064",
+    "store_name": "Jute Palace",
+    "business_name": "KIRUBAKARAN",
+    "website": "https://www.jutepalace.in",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S065",
+    "store_name": "NLHomefood",
+    "business_name": "Sasi Rekha",
+    "website": "https://www.nlhomefood.com",
+    "category": "Consumables",
+    "active": true
+  },
+  {
+    "id": "S066",
+    "store_name": "Kaawaii Cosmetics",
+    "business_name": "PINK PARROT KIDS LLP",
+    "website": "https://kaawaiicosmetics.com",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S067",
+    "store_name": "Priyam Organics",
+    "business_name": "SRIPRIYA SRIDHARAN",
+    "website": "https://priyamorganics.com",
+    "category": "Health",
+    "active": true
+  },
+  {
+    "id": "S068",
+    "store_name": "Boutique Bougainvillea",
+    "business_name": "SHERIN JOSEPH",
+    "website": "https://boutiquebougainvillea.mini.store",
+    "category": "Fashion",
+    "active": true
+  },
+  {
+    "id": "S069",
+    "store_name": "Enzyme Planet",
+    "business_name": "TRISUDHA BOTANICALS LLP",
+    "website": "https://theenzymeplanet.com",
+    "category": "Home Essentials",
+    "active": true
+  },
+  {
+    "id": "S070",
+    "store_name": "Just smart finds co",
+    "business_name": "MANUEL FINNY CHARLES BASKARAN",
+    "website": "https://www.justsmartfinds.com",
+    "category": "Home Essentials",
+    "active": true
+  },
+  {
+    "id": "S071",
+    "store_name": "YESHWANTH RAJ",
+    "business_name": "YESHWANTH RAJ",
+    "website": "https://www.mrlfoods.in",
+    "category": "Consumables",
+    "active": true
+  }
+]

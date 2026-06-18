@@ -1,0 +1,27 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+backend/.env
+frontend/.env.local
+
+# Dependencies
+node_modules/
+backend/.venv/
+
+# Build output
+dist/
+frontend/.next/
+*.tsbuildinfo
+
+# Databases & caches
+*.db
+.prisma/
+
+# OS & IDE
+.DS_Store
+*.log
+
+# Playwright
+playwright-report/
+test-results/

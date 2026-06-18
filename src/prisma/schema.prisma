@@ -1,0 +1,114 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Platform {
+  naar
+  amazon
+  flipkart
+  meesho
+  seller
+}
+
+enum AlertType {
+  lower_price
+  higher_price
+  seller_violation
+  product_missing
+  low_confidence
+}
+
+enum Severity {
+  low
+  medium
+  high
+  critical
+}
+
+model Product {
+  id         String   @id
+  sku        String   @unique
+  name       String
+  variant    String?
+  category   String?
+  basePrice  Float    @map("base_price")
+  meta       Json?
+  url        String
+  isActive   Boolean  @default(true) @map("is_active")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  listings  ProductListing[]
+  snapshots PriceSnapshot[]
+  alerts    PriceAlert[]
+
+  @@map("products")
+}
+
+model ProductListing {
+  id              Int      @id @default(autoincrement())
+  productId       String   @map("product_id")
+  platform        Platform
+  platformId      String?  @map("platform_id")
+  sellerName      String?  @map("seller_name")
+  platformUrl     String   @map("platform_url")
+  matchConfidence Float    @map("match_confidence")
+  matchMethod     String   @map("match_method")
+  isVerified      Boolean  @default(false) @map("is_verified")
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  product   Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+  snapshots PriceSnapshot[]
+
+  @@index([platform, productId])
+  @@map("product_listings")
+}
+
+model PriceSnapshot {
+  id            Int      @id @default(autoincrement())
+  productId     String   @map("product_id")
+  listingId     Int      @map("listing_id")
+  price         Float
+  originalPrice Float?   @map("original_price")
+  discountPct   Float?   @map("discount_pct")
+  inStock       Boolean  @default(true) @map("in_stock")
+  capturedAt    DateTime @default(now()) @map("captured_at")
+
+  product Product        @relation(fields: [productId], references: [id], onDelete: Cascade)
+  listing ProductListing @relation(fields: [listingId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@index([listingId])
+  @@index([capturedAt])
+  @@map("price_snapshots")
+}
+
+model PriceAlert {
+  id               Int        @id @default(autoincrement())
+  productId        String     @map("product_id")
+  listingId        Int?       @map("listing_id")
+  alertType        AlertType  @map("alert_type")
+  severity         Severity
+  naarPrice        Float      @map("naar_price")
+  competitorPrice  Float?     @map("competitor_price")
+  deviationPct     Float?     @map("deviation_pct")
+  platform         String?
+  details          String
+  isResolved       Boolean    @default(false) @map("is_resolved")
+  notified         Boolean    @default(false)
+  createdAt        DateTime   @default(now()) @map("created_at")
+  resolvedAt       DateTime?  @map("resolved_at")
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@index([severity])
+  @@index([isResolved])
+  @@index([createdAt])
+  @@map("price_alerts")
+}
