@@ -47,10 +47,11 @@ services:
       - key: EMBEDDING_MODEL
         value: Xenova/all-MiniLM-L6-v2
 
+  - type: redis
+    name: naar-redis
+    plan: starter
+    ipAllowList: []
+
 databases:
   - name: naar-db
-    plan: starter
-
-  - name: naar-redis
-    type: redis
     plan: starter
