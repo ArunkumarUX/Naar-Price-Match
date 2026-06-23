@@ -14,10 +14,17 @@ await app.register(cors, {
 });
 
 app.get("/", async () => ({
-  app: "Naar Price Monitor",
-  stack: "Node.js 22 · Fastify · Prisma · BullMQ · Transformers.js",
+  app: "Naar Price Monitor API",
+  status: "ok",
   health: "/health",
-  compare_ui: `${config.CORS_ORIGIN}/compare`,
+  endpoints: {
+    health: "GET /health",
+    products: "GET /products",
+    sync_catalog: "POST /reports/sync-catalog",
+    run_scan: "POST /reports/run-scan",
+    comparison: "GET /comparison/matrix",
+    alerts: "GET /alerts",
+  },
 }));
 
 app.get("/health", async () => ({
@@ -35,5 +42,8 @@ await app.register(productsRoutes, { prefix: "/products" });
 await app.register(comparisonRoutes, { prefix: "/comparison" });
 await app.register(reportsRoutes, { prefix: "/reports" });
 
-await app.listen({ port: config.PORT, host: config.HOST });
-console.log(`API listening on http://${config.HOST}:${config.PORT}`);
+const port = Number(process.env.PORT) || config.PORT;
+const host = config.HOST;
+
+await app.listen({ port, host });
+console.log(`API listening on http://${host}:${port}`);
