@@ -1,0 +1,165 @@
+[
+  {
+    "_id": "6960d6b1a4074bd236c13e95",
+    "title": "A2 Cow Ghee Bilona 500ml",
+    "status": "active",
+    "variants": [
+      {
+        "_id": "6960d6b1a4074bd236c13e97",
+        "variantName": "Volume",
+        "variantOption": "ml",
+        "variantValue": 500,
+        "price": 839
+      }
+    ],
+    "category": { "title": "Consumables" },
+    "subCategory": { "title": "Oils" },
+    "seller": { "storeName": "Goodness farm" }
+  },
+  {
+    "_id": "6960d7af980d417cbf3a5237",
+    "title": "Sprouted Ragi Flour",
+    "status": "active",
+    "variants": [
+      {
+        "_id": "6960d7af980d417cbf3a5239",
+        "variantName": "Weight",
+        "variantOption": "g",
+        "variantValue": 500,
+        "price": 126
+      }
+    ],
+    "category": { "title": "Consumables" },
+    "subCategory": { "title": "Grains" },
+    "seller": { "storeName": "Goodness farm" }
+  },
+  {
+    "_id": "6960db8ea4074bd236c13f63",
+    "title": "Indian Sesame Oil/ Gingely Oil Cold Pressed",
+    "status": "active",
+    "variants": [
+      {
+        "_id": "6960db8ea4074bd236c13f65",
+        "variantName": "Volume",
+        "variantOption": "l",
+        "variantValue": 1,
+        "price": 536
+      }
+    ],
+    "category": { "title": "Consumables" },
+    "subCategory": { "title": "Oils" },
+    "seller": { "storeName": "Goodness farm" }
+  },
+  {
+    "_id": "6960dc75980d417cbf3a52b1",
+    "title": "Groundnut Oil, Cold Pressed",
+    "status": "active",
+    "variants": [
+      {
+        "_id": "6960dc75980d417cbf3a52b3",
+        "variantName": "Volume",
+        "variantOption": "l",
+        "variantValue": 1,
+        "price": 419
+      }
+    ],
+    "category": { "title": "Consumables" },
+    "subCategory": { "title": "Oils" },
+    "seller": { "storeName": "Goodness farm" }
+  },
+  {
+    "_id": "6960dd50980d417cbf3a52d8",
+    "title": "Coconut oil Unsulphatec Cold Pressed",
+    "status": "active",
+    "variants": [
+      {
+        "_id": "6960dd50980d417cbf3a52da",
+        "variantName": "Volume",
+        "variantOption": "l",
+        "variantValue": 1,
+        "price": 576
+      }
+    ],
+    "category": { "title": "Consumables" },
+    "subCategory": { "title": "Oils" },
+    "seller": { "storeName": "Goodness farm" }
+  },
+  {
+    "_id": "6a168e63039bfd1908d567a2",
+    "title": "Combo Pack of 3 - Masala Drying Cloth with Net Multipurpose",
+    "status": "active",
+    "variants": [
+      {
+        "_id": "6a168e63039bfd1908d567a3",
+        "variantName": "Size",
+        "variantOption": "Medium",
+        "price": 682
+      }
+    ],
+    "category": { "title": "Home Essentials" },
+    "subCategory": { "title": "Home Essentials" },
+    "seller": { "storeName": "Homee Loom" }
+  },
+  {
+    "_id": "6a31629eb85dc1b4b67cbe31",
+    "title": "Mayil Vel - Flying Vel Car Hanging Figurine",
+    "status": "active",
+    "variants": [
+      {
+        "_id": "6a31629eb85dc1b4b67cbe33",
+        "variantName": "default",
+        "price": 524
+      }
+    ],
+    "category": { "title": "Home Essentials" },
+    "subCategory": { "title": "Decor Pieces" },
+    "seller": { "storeName": "YugaVeera" }
+  },
+  {
+    "_id": "6a3160dbb85dc1b4b67cbe10",
+    "title": "Gopuram Manjal Kumkum Holder (Magnetic Miniature)",
+    "status": "active",
+    "variants": [
+      {
+        "_id": "6a3160dbb85dc1b4b67cbe14",
+        "variantName": "default",
+        "price": 629
+      }
+    ],
+    "category": { "title": "Pooja Items" },
+    "subCategory": { "title": "Idols" },
+    "seller": { "storeName": "YugaVeera" }
+  },
+  {
+    "_id": "6a3167ed1e56f98e4d16f9a2",
+    "title": "Veera Vel - The Hand of Murugan",
+    "status": "active",
+    "variants": [
+      {
+        "_id": "6a3167ed1e56f98e4d16f9a5",
+        "variantName": "default",
+        "price": 755
+      }
+    ],
+    "category": { "title": "Home Essentials" },
+    "subCategory": { "title": "Decor Pieces" },
+    "seller": { "storeName": "YugaVeera" }
+  },
+  {
+    "_id": "69de0e471412e2d2c12e02bd",
+    "title": "Amris karunjeeragam Omam Vendhayam powder",
+    "status": "active",
+    "variants": [
+      {
+        "_id": "69de0e471412e2d2c12e02c1",
+        "variantName": "Weight",
+        "variantOption": "g",
+        "variantValue": 100,
+        "price": 107
+      }
+    ],
+    "category": { "title": "Consumables" },
+    "subCategory": { "title": "Specialty Foods" },
+    "seller": { "storeName": "Amris from moms kitchen" }
+  }
+]

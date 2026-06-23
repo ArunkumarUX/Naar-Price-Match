@@ -8,11 +8,14 @@ export async function reportsRoutes(app: FastifyInstance) {
     try {
       const { imported, source } = await syncNaarCatalog();
       if (!imported) {
+        const tried = (await import("../../scrapers/naar-catalog.fetch.js")).catalogApiCandidates();
         return {
           status: "failed",
           imported: 0,
           message:
             "Could not fetch products from NAAR_CATALOG_API or known commerce endpoints. Set NAAR_CATALOG_API in Render env, or use POST /products/import-catalog for one-off imports.",
+          tried_urls: tried.slice(0, 6),
+          import_hint: "POST /products/import-catalog with data/naar-catalog-seed.json",
         };
       }
       return { status: "ok", imported, source: source ?? "naar" };
