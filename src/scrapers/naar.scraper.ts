@@ -1,5 +1,6 @@
 import { chromium } from "playwright";
 import { config } from "../lib/config.js";
+import { parseNaarCommerceCatalog } from "./naar-catalog.parser.js";
 
 export interface NaarProduct {
   sku: string;
@@ -14,24 +15,22 @@ export interface NaarProduct {
 export async function* scrapeNaarCatalog(): AsyncGenerator<NaarProduct> {
   if (config.NAAR_CATALOG_API) {
     try {
-      const res = await fetch(config.NAAR_CATALOG_API);
+      const res = await fetch(config.NAAR_CATALOG_API, {
+        headers: {
+          Accept: "application/json",
+          Origin: config.NAAR_BASE_URL,
+          Referer: config.NAAR_SHOP_URL,
+        },
+      });
       if (res.ok) {
-        const data = (await res.json()) as { products?: Record<string, unknown>[] };
-        for (const item of data.products ?? []) {
-          const name = String(item.name ?? "").trim();
-          const price = parseFloat(String(item.price ?? item.base_price ?? "0"));
-          if (!name || price <= 0) continue;
-          yield {
-            sku: String(item.sku ?? name.slice(0, 40)),
-            name,
-            variant: String(item.variant ?? "default"),
-            price,
-            url: String(item.url ?? config.NAAR_SHOP_URL),
-            category: item.category ? String(item.category) : undefined,
-            source: "catalog_api",
-          };
+        const data = await res.json();
+        const parsed = parseNaarCommerceCatalog(data);
+        if (parsed.length) {
+          for (const product of parsed) {
+            yield product;
+          }
+          return;
         }
-        return;
       }
     } catch {
       /* fall through */

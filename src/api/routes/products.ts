@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { prisma } from "../../lib/prisma.js";
 import { upsertProduct } from "../../services/catalog.js";
+import { parseNaarCommerceCatalog } from "../../scrapers/naar-catalog.parser.js";
 
 export async function productsRoutes(app: FastifyInstance) {
   app.get("/", async (req) => {
@@ -27,24 +28,20 @@ export async function productsRoutes(app: FastifyInstance) {
   });
 
   app.post("/import-catalog", async (req) => {
-    const body = req.body as { products?: Record<string, unknown>[] };
-    let imported = 0;
-    for (const item of body.products ?? []) {
-      const name = String(item.name ?? "").trim();
-      if (!name) continue;
-      const price = parseFloat(String(item.price ?? item.base_price ?? "0").replace(/,/g, ""));
-      if (!Number.isFinite(price) || price <= 0) continue;
-      await upsertProduct({
-        sku: String(item.sku ?? name.slice(0, 40)),
-        name,
-        variant: String(item.variant ?? "default"),
-        price,
-        url: String(item.url ?? "https://naar.io/shop"),
-        category: item.category ? String(item.category) : undefined,
-      });
-      imported++;
+    const body = req.body as unknown;
+    const records = parseNaarCommerceCatalog(body);
+
+    for (const product of records) {
+      await upsertProduct(product);
     }
-    return { imported, total: body.products?.length ?? 0 };
+
+    const rawCount = Array.isArray(body)
+      ? body.length
+      : Array.isArray((body as { products?: unknown[] })?.products)
+        ? (body as { products: unknown[] }).products.length
+        : records.length;
+
+    return { imported: records.length, total: rawCount, parsed: records.length };
   });
 
   app.get("/:productId", async (req) => {
