@@ -1,19 +1,48 @@
 import { buildComparisonRow } from "../engine/price.comparator.js";
 import { matchProduct, toMatchedListing } from "../matcher/product.matcher.js";
 import { searchAmazon, searchFlipkart, searchMeesho } from "../scrapers/marketplace.scraper.js";
-import { scrapeNaarCatalog } from "../scrapers/naar.scraper.js";
 import { searchSellers } from "../scrapers/seller.registry.js";
 import { config } from "../lib/config.js";
 import { prisma } from "../lib/prisma.js";
-import { upsertProduct } from "../services/catalog.js";
+import { syncNaarCatalog } from "../services/catalog.js";
 import type { MatchCandidate } from "../matcher/product.matcher.js";
 
 export async function runFullPriceCheck(limit = 25) {
+  let dbProducts = await prisma.product.findMany({
+    where: { isActive: true },
+    take: limit,
+    orderBy: { updatedAt: "desc" },
+  });
+
+  if (!dbProducts.length) {
+    const catalog = await syncNaarCatalog();
+    if (!catalog.imported) {
+      return {
+        scanned: 0,
+        skus: [] as string[],
+        catalog_error:
+          "Naar catalog empty — set NAAR_CATALOG_API on Render or run POST /reports/sync-catalog first.",
+      };
+    }
+    dbProducts = await prisma.product.findMany({
+      where: { isActive: true },
+      take: limit,
+      orderBy: { updatedAt: "desc" },
+    });
+  }
+
   const scanned: string[] = [];
   let count = 0;
 
-  for await (const product of scrapeNaarCatalog()) {
-    await upsertProduct(product);
+  for (const product of dbProducts) {
+    const naarProduct = {
+      sku: product.sku,
+      name: product.name,
+      variant: product.variant ?? "default",
+      price: product.basePrice,
+      url: product.url,
+      category: product.category ?? undefined,
+    };
 
     const matches: Record<string, unknown> = {};
     for (const [platform, search] of [
@@ -22,19 +51,19 @@ export async function runFullPriceCheck(limit = 25) {
       ["meesho", searchMeesho],
     ] as const) {
       const candidates = await search(product.name, 3);
-      const matched = await matchProduct(product, candidates as MatchCandidate[], config.MIN_MATCH_CONFIDENCE);
+      const matched = await matchProduct(naarProduct, candidates as MatchCandidate[], config.MIN_MATCH_CONFIDENCE);
       matches[platform] = matched[0] ? toMatchedListing(matched[0]) : null;
     }
 
     const sellerCandidates = await searchSellers(product.name, 8);
     const sellerMatched = await matchProduct(
-      product,
+      naarProduct,
       sellerCandidates as MatchCandidate[],
       config.MIN_MATCH_CONFIDENCE - 0.1,
     );
     matches.sellers = sellerMatched.slice(0, 5).map(toMatchedListing);
 
-    const row = buildComparisonRow(product, matches);
+    const row = buildComparisonRow(naarProduct, matches);
     await persistComparisonRow(product.sku, row);
     scanned.push(product.sku);
     count++;

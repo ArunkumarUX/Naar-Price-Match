@@ -17,6 +17,7 @@ const envSchema = z.object({
   NAAR_BASE_URL: z.string().default("https://naar.io"),
   NAAR_SHOP_URL: z.string().default("https://naar.io/shop"),
   NAAR_CATALOG_API: z.string().optional().default(""),
+  NAAR_CATALOG_API_KEY: z.string().optional().default(""),
   BRIGHTDATA_PROXY: z.string().optional().default(""),
   SCRAPERAPI_KEY: z.string().optional().default(""),
   SENDGRID_API_KEY: z.string().optional().default(""),

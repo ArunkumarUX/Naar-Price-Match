@@ -16,6 +16,16 @@ export function createPriceCheckQueue(connection: Redis) {
 
 export async function scheduleRepeatableJobs(queue: Queue) {
   await queue.add(
+    "sync-catalog",
+    {},
+    {
+      repeat: { pattern: "30 1 * * *", tz: "Asia/Kolkata" },
+      removeOnComplete: 100,
+      removeOnFail: 50,
+    },
+  );
+
+  await queue.add(
     "daily-full-check",
     {},
     {
@@ -41,9 +51,15 @@ export function createPriceCheckWorker(connection: Redis) {
     PRICE_CHECK_QUEUE,
     async (job) => {
       if (job.name === "sync-catalog") {
-        const imported = await syncNaarCatalog();
-        return { imported };
+        return syncNaarCatalog();
       }
+
+      if (job.name === "daily-full-check") {
+        const catalog = await syncNaarCatalog();
+        const scan = await runFullPriceCheck(25);
+        return { ...scan, catalog };
+      }
+
       const onlyCritical = Boolean(job.data?.onlyCritical);
       const limit = onlyCritical ? 10 : 25;
       return runFullPriceCheck(limit);

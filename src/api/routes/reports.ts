@@ -6,16 +6,16 @@ import { syncNaarCatalog } from "../../services/catalog.js";
 export async function reportsRoutes(app: FastifyInstance) {
   app.post("/sync-catalog", async () => {
     try {
-      const imported = await syncNaarCatalog();
+      const { imported, source } = await syncNaarCatalog();
       if (!imported) {
         return {
           status: "failed",
           imported: 0,
           message:
-            "Could not fetch products from naar.io/shop. Set NAAR_CATALOG_API or use POST /products/import-catalog.",
+            "Could not fetch products from NAAR_CATALOG_API or known commerce endpoints. Set NAAR_CATALOG_API in Render env, or use POST /products/import-catalog for one-off imports.",
         };
       }
-      return { status: "ok", imported, source: "naar" };
+      return { status: "ok", imported, source: source ?? "naar" };
     } catch (err) {
       return {
         status: "failed",

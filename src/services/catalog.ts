@@ -32,12 +32,21 @@ export async function upsertProduct(input: NaarProduct) {
   });
 }
 
-export async function syncNaarCatalog() {
+export interface CatalogSyncResult {
+  imported: number;
+  source?: string;
+}
+
+export async function syncNaarCatalog(): Promise<CatalogSyncResult> {
   const { scrapeNaarCatalog } = await import("../scrapers/naar.scraper.js");
   let imported = 0;
+  let source: string | undefined;
+
   for await (const product of scrapeNaarCatalog()) {
+    source = product.source ?? source;
     await upsertProduct(product);
     imported++;
   }
-  return imported;
+
+  return { imported, source };
 }

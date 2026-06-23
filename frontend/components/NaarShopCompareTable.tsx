@@ -193,7 +193,7 @@ export function NaarShopCompareTable() {
                       On the dashboard, click <strong>Sync Naar Catalog</strong> first, then <strong>Run Full Scan</strong>.
                     </p>
                     <p className="text-xs">
-                      If sync fails, add <code>NAAR_CATALOG_API</code> or <code>SCRAPERAPI_KEY</code> to <code>backend/.env</code>
+                      If sync fails, set <code>NAAR_CATALOG_API</code> in the project <code>.env</code> (or Render env) and run <strong>Sync Naar Catalog</strong>.
                     </p>
                   </td>
                 </tr>
