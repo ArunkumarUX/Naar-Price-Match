@@ -116,6 +116,7 @@ export const useProducts = () =>
       if (!res.ok) throw new Error("Failed to fetch products");
       return res.json();
     },
+    refetchInterval: 60_000,
   });
 
 export const useResolveAlert = () => {
@@ -165,7 +166,7 @@ export const useComparisonMatrix = () =>
       }
       return res.json();
     },
-    refetchInterval: 120_000,
+    refetchInterval: 60_000,
     retry: 2,
   });
 

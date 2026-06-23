@@ -21,19 +21,38 @@ function catalogHeaders(): Record<string, string> {
 
 export function catalogApiCandidates(): string[] {
   const configured = config.NAAR_CATALOG_API.trim();
-  const defaults = [
+  const bases = [
+    configured,
     `${config.NAAR_BASE_URL}/api/v1/ecommerce/products`,
     `${config.NAAR_BASE_URL}/api/ecommerce/products`,
     `${config.NAAR_BASE_URL}/api/shop/products`,
     `${config.NAAR_BASE_URL}/api/products`,
     `${config.NAAR_BASE_URL}/api/v1/products`,
     "https://api.naar.io/ecommerce/products",
-    "https://api.naar.io/v1/products",
+    "https://api.naar.io/v1/ecommerce/products",
     "https://api.naar.io/products",
     "https://api.naar.io/shop/products",
     `${config.NAAR_BASE_URL}/products.json`,
+  ].filter(Boolean);
+
+  const querySuffixes = [
+    "",
+    "?status=active&limit=500",
+    "?limit=500",
+    "?showInSellerShoppingPage=true&limit=500",
   ];
-  return [...new Set([configured, ...defaults].filter(Boolean))];
+
+  const urls: string[] = [];
+  for (const base of bases) {
+    if (base.includes("?")) {
+      urls.push(base);
+      continue;
+    }
+    for (const suffix of querySuffixes) {
+      urls.push(`${base}${suffix}`);
+    }
+  }
+  return [...new Set(urls)];
 }
 
 async function fetchCatalogFromUrl(url: string): Promise<CatalogFetchResult | null> {

@@ -5,6 +5,7 @@ import { comparisonRoutes } from "./routes/comparison.js";
 import { productsRoutes } from "./routes/products.js";
 import { reportsRoutes } from "./routes/reports.js";
 import { config, isProduction } from "../lib/config.js";
+import { startCatalogSyncScheduler } from "../jobs/catalog-sync.scheduler.js";
 
 const app = Fastify({ logger: true });
 
@@ -57,4 +58,5 @@ const port = Number(process.env.PORT) || config.PORT;
 const host = config.HOST;
 
 await app.listen({ port, host });
+startCatalogSyncScheduler();
 console.log(`API listening on http://${host}:${port}`);

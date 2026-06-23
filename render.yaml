@@ -38,6 +38,8 @@ services:
         sync: false
       - key: CORS_ORIGIN
         value: https://naar-price-monitor.vercel.app
+      - key: CATALOG_SYNC_INTERVAL_MS
+        value: "1800000"
 
   - type: worker
     name: naar-worker

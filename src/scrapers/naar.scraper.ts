@@ -1,6 +1,7 @@
 import { chromium } from "playwright";
 import { config } from "../lib/config.js";
 import { fetchNaarCommerceCatalog } from "./naar-catalog.fetch.js";
+import { scrapeNaarShopLive } from "./naar-shop.playwright.js";
 
 export interface NaarProduct {
   sku: string;
@@ -12,11 +13,29 @@ export interface NaarProduct {
   source?: string;
 }
 
+function launchOptions() {
+  return {
+    headless: true,
+    ...(config.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+      ? { executablePath: config.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH }
+      : {}),
+    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+  };
+}
+
 export async function* scrapeNaarCatalog(): AsyncGenerator<NaarProduct> {
   const apiCatalog = await fetchNaarCommerceCatalog();
   if (apiCatalog) {
     for (const product of apiCatalog.products) {
       yield { ...product, source: product.source ?? apiCatalog.source };
+    }
+    return;
+  }
+
+  const liveShop = await scrapeNaarShopLive();
+  if (liveShop?.products.length) {
+    for (const product of liveShop.products) {
+      yield { ...product, source: product.source ?? liveShop.source };
     }
     return;
   }
@@ -50,22 +69,17 @@ export async function* scrapeNaarCatalog(): AsyncGenerator<NaarProduct> {
     /* fall through */
   }
 
-  const browser = await chromium.launch({
-    headless: true,
-    ...(config.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
-      ? { executablePath: config.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH }
-      : {}),
-  });
+  const browser = await chromium.launch(launchOptions());
   const page = await browser.newPage();
 
   try {
-    await page.goto(`${config.NAAR_BASE_URL}/collections/all`, {
+    await page.goto(`${config.NAAR_SHOP_URL}`, {
       waitUntil: "domcontentloaded",
       timeout: 60_000,
     });
 
-    const links = await page.$$eval("a[href*='/products/']", (els) =>
-      [...new Set(els.map((e) => (e as { href: string }).href))],
+    const links = await page.$$eval('a[href*="/shop/product/"]', (els) =>
+      [...new Set(els.map((e) => (e as HTMLAnchorElement).href))],
     );
 
     for (const link of links.slice(0, 100)) {

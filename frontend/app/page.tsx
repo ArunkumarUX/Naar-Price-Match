@@ -22,7 +22,7 @@ export default function Dashboard() {
   return (
     <main className="p-6 max-w-screen-xl mx-auto space-y-8 pb-12">
       <PageHeader
-        eyebrow="naar.io/shop · Weekly Cron"
+        eyebrow="naar.io/shop · Live sync every 30 min"
         title="Price Parity Command Center"
         description="Monitor exact Naar Shop prices against Amazon, Flipkart, Meesho and authorized seller websites."
         action={
