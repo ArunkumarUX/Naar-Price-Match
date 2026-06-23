@@ -1,0 +1,8 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "rootDirectory": "frontend",
+  "env": {
+    "BACKEND_API_URL": "https://naar-api.onrender.com"
+  }
+}

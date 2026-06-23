@@ -1,10 +1,15 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 
-/** Same-origin proxy in browser (avoids CORS); direct URL for SSR/scripts. */
-export const API_BASE =
-  typeof window !== "undefined"
-    ? "/backend-api"
-    : process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+/** Browser uses same-origin runtime proxy; SSR uses direct backend URL. */
+export const API_BASE = typeof window !== "undefined" ? "/backend-api" : getServerApiBase();
+
+function getServerApiBase(): string {
+  return (
+    process.env.BACKEND_API_URL ||
+    process.env.NEXT_PUBLIC_API_URL ||
+    (process.env.NODE_ENV === "production" ? "https://naar-api.onrender.com" : "http://127.0.0.1:8000")
+  ).replace(/\/$/, "");
+}
 
 const BASE = API_BASE;
 

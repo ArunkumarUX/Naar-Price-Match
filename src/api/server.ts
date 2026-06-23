@@ -9,7 +9,18 @@ import { config, isProduction } from "../lib/config.js";
 const app = Fastify({ logger: true });
 
 await app.register(cors, {
-  origin: [config.CORS_ORIGIN, "http://127.0.0.1:3000", "http://localhost:3000"],
+  origin: (origin, callback) => {
+    const allowed = new Set([
+      config.CORS_ORIGIN,
+      "http://127.0.0.1:3000",
+      "http://localhost:3000",
+    ]);
+    if (!origin || allowed.has(origin) || /\.vercel\.app$/i.test(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(null, false);
+  },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
 });
 
