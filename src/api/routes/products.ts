@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { prisma } from "../../lib/prisma.js";
+import { normalizeNaarProductUrl } from "../../lib/naar-url.js";
 import { upsertProduct } from "../../services/catalog.js";
 import { parseNaarCommerceCatalog } from "../../scrapers/naar-catalog.parser.js";
 
@@ -23,7 +24,7 @@ export async function productsRoutes(app: FastifyInstance) {
       variant: p.variant,
       base_price: p.basePrice,
       category: p.category,
-      url: p.url,
+      url: normalizeNaarProductUrl(p.url, p.name),
     }));
   });
 
@@ -58,7 +59,7 @@ export async function productsRoutes(app: FastifyInstance) {
       variant: product.variant,
       base_price: product.basePrice,
       category: product.category,
-      url: product.url,
+      url: normalizeNaarProductUrl(product.url, product.name),
       listings: product.listings.map((l) => ({
         platform: l.platform,
         platform_id: l.platformId,

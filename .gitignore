@@ -25,3 +25,4 @@ frontend/.next/
 # Playwright
 playwright-report/
 test-results/
+.vercel

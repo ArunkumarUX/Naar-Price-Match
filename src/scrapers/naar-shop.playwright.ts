@@ -1,5 +1,6 @@
 import { chromium, type Browser, type Page } from "playwright";
 import { config } from "../lib/config.js";
+import { normalizeNaarProductUrl } from "../lib/naar-url.js";
 import { parseNaarCommerceCatalog } from "./naar-catalog.parser.js";
 import type { NaarProduct } from "./naar.scraper.js";
 
@@ -94,7 +95,7 @@ async function collectFromDom(page: Page): Promise<NaarProduct[]> {
     name: card.name,
     variant: "default",
     price: card.price,
-    url: card.url,
+    url: normalizeNaarProductUrl(card.url, card.name),
     source: "playwright_shop_dom",
   }));
 }

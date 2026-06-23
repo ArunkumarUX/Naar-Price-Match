@@ -1,4 +1,5 @@
 import { config } from "../lib/config.js";
+import { normalizeNaarProductUrl } from "../lib/naar-url.js";
 
 export interface ChannelStatus {
   status: string;
@@ -36,7 +37,7 @@ export function buildComparisonRow(
     name: product.name,
     variant: product.variant,
     naar_price: naarPrice,
-    naar_url: product.url,
+    naar_url: normalizeNaarProductUrl(product.url, product.name),
     channels,
   };
 

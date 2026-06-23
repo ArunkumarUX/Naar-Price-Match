@@ -2,6 +2,7 @@
 
 import { useComparisonMatrix, useSellers, type ComparisonProduct } from "@/lib/api";
 import { parityStatus } from "@/lib/brand";
+import { normalizeNaarProductUrl } from "@/lib/naar-url";
 
 const PLATFORMS = [
   { key: "naar" as const, label: "Naar" },
@@ -35,9 +36,10 @@ function ShopRow({ product }: { product: ComparisonProduct }) {
   const sellers = channels.sellers || [];
   const bestSeller = summary?.best_seller;
   const lowest = summary?.lowest_competitor;
+  const naarShopUrl = normalizeNaarProductUrl(product.naar_url, product.name);
 
   const cells: Record<string, { price: number | null; status: string; label?: string; url?: string; sub?: string }> = {
-    naar: { price: product.naar_price, status: "ok", label: "Naar shop", url: product.naar_url || "https://naar.io/shop" },
+    naar: { price: product.naar_price, status: "ok", label: "Naar shop", url: naarShopUrl },
     amazon: {
       price: channels.amazon?.price ?? null,
       status: channels.amazon?.status || "missing",
@@ -72,12 +74,13 @@ function ShopRow({ product }: { product: ComparisonProduct }) {
         <p className="font-extrabold text-forest mt-0.5 leading-snug">{product.name}</p>
         {product.variant && <p className="text-xs text-naar-slate mt-0.5">{product.variant}</p>}
         <a
-          href={product.naar_url || "https://naar.io/shop"}
+          href={naarShopUrl}
           target="_blank"
           rel="noreferrer"
+          title="Product detail pages are in the Naar app. This opens the web shop."
           className="text-[10px] text-turquoise-dim font-bold mt-2 inline-block hover:underline"
         >
-          View on Naar →
+          Browse Naar Shop →
         </a>
       </td>
       {PLATFORMS.map((p) => {

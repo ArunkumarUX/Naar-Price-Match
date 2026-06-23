@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { classifyChannel } from "../../engine/price.comparator.js";
 import { prisma } from "../../lib/prisma.js";
+import { normalizeNaarProductUrl } from "../../lib/naar-url.js";
 import { loadSellers, sellerCount } from "../../scrapers/seller.registry.js";
 
 function productFromDb(
@@ -45,7 +46,7 @@ function productFromDb(
     name: product.name,
     variant: product.variant,
     naar_price: product.basePrice,
-    naar_url: product.url,
+    naar_url: normalizeNaarProductUrl(product.url, product.name),
     channels: {} as Record<string, unknown>,
   };
 

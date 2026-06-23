@@ -2,6 +2,7 @@
 
 import { PageHeader } from "@/components/PageHeader";
 import { useProducts } from "@/lib/api";
+import { normalizeNaarProductUrl } from "@/lib/naar-url";
 
 export default function ProductsPage() {
   const { data: products = [], isLoading } = useProducts();
@@ -24,8 +25,14 @@ export default function ProductsPage() {
             </div>
             <div className="text-right shrink-0">
               <p className="text-xl font-extrabold text-forest tabular-nums">₹{p.base_price.toLocaleString("en-IN")}</p>
-              <a href={p.url} target="_blank" rel="noreferrer" className="text-xs text-turquoise-dim font-bold hover:underline">
-                View on Naar →
+              <a
+                href={normalizeNaarProductUrl(p.url, p.name)}
+                target="_blank"
+                rel="noreferrer"
+                title="Product detail pages are in the Naar app. This opens the web shop."
+                className="text-xs text-turquoise-dim font-bold hover:underline"
+              >
+                Browse Naar Shop →
               </a>
             </div>
           </div>

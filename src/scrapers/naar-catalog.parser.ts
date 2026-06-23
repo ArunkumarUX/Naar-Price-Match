@@ -1,4 +1,5 @@
 import { config } from "../lib/config.js";
+import { normalizeNaarProductUrl, naarWebShopUrl } from "../lib/naar-url.js";
 import type { NaarProduct } from "./naar.scraper.js";
 
 type UnknownRecord = Record<string, unknown>;
@@ -42,8 +43,14 @@ function categoryLabel(item: UnknownRecord): string | undefined {
   return parts.length ? parts.join(" / ") : undefined;
 }
 
-function productUrl(productId: string): string {
-  return `${config.NAAR_BASE_URL}/shop/product/${productId}`;
+function productUrl(_productId: string, title: string): string {
+  return naarWebShopUrl(title);
+}
+
+function resolveProductUrl(item: UnknownRecord, productId: string, title: string): string {
+  const raw = String(item.url ?? item.productUrl ?? "").trim();
+  if (raw) return normalizeNaarProductUrl(raw, title);
+  return productId ? productUrl(productId, title) : config.NAAR_SHOP_URL;
 }
 
 function parsePrice(value: unknown): number | null {
@@ -82,7 +89,7 @@ export function parseNaarCommerceCatalog(payload: unknown): NaarProduct[] {
         name: title,
         variant: "default",
         price,
-        url: String(item.url ?? item.productUrl ?? (productId ? productUrl(productId) : config.NAAR_SHOP_URL)),
+        url: resolveProductUrl(item, productId, title),
         category,
         source: storeName ? `naar_api:${storeName}` : "naar_api",
       });
@@ -106,7 +113,7 @@ export function parseNaarCommerceCatalog(payload: unknown): NaarProduct[] {
         name: title,
         variant: variantLabel(variant),
         price,
-        url: productId ? productUrl(productId) : config.NAAR_SHOP_URL,
+        url: resolveProductUrl(item, productId, title),
         category,
         source: storeName ? `naar_api:${storeName}` : "naar_api",
       });
