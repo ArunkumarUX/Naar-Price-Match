@@ -3,7 +3,7 @@ services:
     name: naar-api
     runtime: node
     plan: free
-    buildCommand: npm install && npm run build && npm run migrate:deploy
+    buildCommand: npm install && npx playwright install --with-deps chromium && npm run build && npm run migrate:deploy
     startCommand: node dist/api/server.js
     healthCheckPath: /health
     envVars:
@@ -39,7 +39,7 @@ services:
     name: naar-worker
     runtime: node
     plan: free
-    buildCommand: npm install && npm run build && npm run migrate:deploy
+    buildCommand: npm install && npx playwright install --with-deps chromium && npm run build && npm run migrate:deploy
     startCommand: node dist/jobs/worker.js
     envVars:
       - key: NODE_ENV
