@@ -33,7 +33,7 @@ services:
       - key: NAAR_CATALOG_API_KEY
         sync: false
       - key: CORS_ORIGIN
-        value: https://your-frontend.vercel.app
+        value: https://naar-price-monitor.vercel.app
 
   - type: worker
     name: naar-worker
