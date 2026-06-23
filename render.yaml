@@ -1,14 +1,18 @@
 services:
   - type: web
     name: naar-api
-    runtime: node
+    runtime: docker
     plan: free
-    buildCommand: npm install && npx playwright install --with-deps chromium && npm run build && npm run migrate:deploy
-    startCommand: node dist/api/server.js
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
+      - key: PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
+        value: "1"
+      - key: PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+        value: /usr/bin/chromium-browser
       - key: DATABASE_URL
         fromDatabase:
           name: naar-db
@@ -37,13 +41,18 @@ services:
 
   - type: worker
     name: naar-worker
-    runtime: node
+    runtime: docker
     plan: free
-    buildCommand: npm install && npx playwright install --with-deps chromium && npm run build && npm run migrate:deploy
-    startCommand: node dist/jobs/worker.js
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: sh -c "npx prisma migrate deploy && node dist/jobs/worker.js"
     envVars:
       - key: NODE_ENV
         value: production
+      - key: PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD
+        value: "1"
+      - key: PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+        value: /usr/bin/chromium-browser
       - key: DATABASE_URL
         fromDatabase:
           name: naar-db

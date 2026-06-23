@@ -50,7 +50,12 @@ export async function* scrapeNaarCatalog(): AsyncGenerator<NaarProduct> {
     /* fall through */
   }
 
-  const browser = await chromium.launch({ headless: true });
+  const browser = await chromium.launch({
+    headless: true,
+    ...(config.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH
+      ? { executablePath: config.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH }
+      : {}),
+  });
   const page = await browser.newPage();
 
   try {
