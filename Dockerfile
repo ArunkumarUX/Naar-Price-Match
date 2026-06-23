@@ -9,11 +9,13 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
 ENV NODE_ENV=production
 
+# Prisma postinstall needs schema before `npm install`
 COPY package*.json ./
+COPY src/prisma ./src/prisma
 RUN npm install
 
 COPY . .
-RUN npx prisma generate && npm run build
+RUN npm run build
 
 EXPOSE 8000
 

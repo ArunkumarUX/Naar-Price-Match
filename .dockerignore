@@ -1,0 +1,12 @@
+node_modules
+.git
+.next
+frontend
+backend
+dist
+.env
+.env.*
+*.md
+__pycache__
+.pytest_cache
+.cursor
