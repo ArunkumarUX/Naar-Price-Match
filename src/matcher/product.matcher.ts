@@ -83,16 +83,21 @@ export async function matchProduct(
       const fuseResult = fuse.search(naar.name);
       const fuseScore = fuseResult[0] ? 1 - (fuseResult[0].score ?? 1) : 0;
 
-      const [embN, embC] = await Promise.all([
-        embed(naar.name),
-        embed(candidate.title ?? ""),
-      ]);
-      const cosine = cosineSimilarity(embN, embC);
-      const variantBoost = variantMatch(naar.variant, candidate.title ?? "") ? 0.1 : 0;
+      if (fuseScore >= 0.55) {
+        method = "title_fuzzy";
+        score = fuseScore;
+      } else {
+        const [embN, embC] = await Promise.all([
+          embed(naar.name),
+          embed(candidate.title ?? ""),
+        ]);
+        const cosine = cosineSimilarity(embN, embC);
+        const variantBoost = variantMatch(naar.variant, candidate.title ?? "") ? 0.1 : 0;
 
-      const embeddingScore = Math.min(1, cosine + variantBoost);
-      method = embeddingScore > fuseScore * 0.8 ? "embedding" : "title_fuzzy";
-      score = Math.max(embeddingScore, fuseScore * 0.8);
+        const embeddingScore = Math.min(1, cosine + variantBoost);
+        method = embeddingScore > fuseScore * 0.8 ? "embedding" : "title_fuzzy";
+        score = Math.max(embeddingScore, fuseScore * 0.8);
+      }
     }
 
     if (score >= minConfidence) {

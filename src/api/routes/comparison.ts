@@ -25,8 +25,9 @@ function productFromDb(
 
   for (const listing of product.listings) {
     const latest = listing.snapshots.sort((a, b) => b.capturedAt.getTime() - a.capturedAt.getTime())[0];
+    const price = latest?.price && latest.price > 0 ? latest.price : null;
     const entry = {
-      price: latest?.price ?? null,
+      price,
       url: listing.platformUrl,
       match_score: listing.matchConfidence,
       match_method: listing.matchMethod,

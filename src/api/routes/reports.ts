@@ -28,9 +28,20 @@ export async function reportsRoutes(app: FastifyInstance) {
     }
   });
 
-  app.post("/run-scan", async () => {
-    const result = await runFullPriceCheck(25);
-    return { status: "completed", ...result };
+  app.post("/run-scan", async (req) => {
+    const q = req.query as { limit?: string };
+    const limit = Math.min(Math.max(Number(q.limit ?? 10), 1), 25);
+
+    void runFullPriceCheck(limit).catch((err) => {
+      req.log.error({ err }, "Background price scan failed");
+    });
+
+    return {
+      status: "started",
+      limit,
+      message:
+        "Competitor price scan started in the background. Amazon, Flipkart and Meesho are scraped with Playwright — refresh the compare page in 2–5 minutes.",
+    };
   });
 
   app.post("/trigger-price-check", async () => {

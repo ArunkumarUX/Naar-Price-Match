@@ -67,7 +67,10 @@ export default function Dashboard() {
         >
           {runScan.data?.catalog_error
             ? runScan.data.catalog_error
-            : `Scan complete — ${runScan.data?.alerts ?? 0} alerts across ${runScan.data?.products ?? 0} products`}
+            : runScan.data?.message ||
+              (runScan.data?.status === "started"
+                ? `Competitor scan started for up to ${runScan.data?.limit ?? 10} products — refresh compare in a few minutes.`
+                : `Scan complete — ${runScan.data?.scanned ?? 0} products checked`)}
         </div>
       )}
 

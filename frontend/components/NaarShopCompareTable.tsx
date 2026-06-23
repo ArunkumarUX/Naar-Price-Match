@@ -1,6 +1,6 @@
 "use client";
 
-import { useComparisonMatrix, useSellers, type ComparisonProduct } from "@/lib/api";
+import { useComparisonMatrix, useRunScan, useSellers, type ComparisonProduct } from "@/lib/api";
 import { parityStatus } from "@/lib/brand";
 import { normalizeNaarProductUrl } from "@/lib/naar-url";
 
@@ -106,9 +106,9 @@ function ShopRow({ product }: { product: ComparisonProduct }) {
               </p>
             )}
             {cell.sub && <p className="text-[10px] text-naar-warm mt-1 truncate max-w-[120px] ml-auto">{cell.sub}</p>}
-            {cell.url && !isNaar && (
+            {cell.url && (
               <a href={cell.url} target="_blank" rel="noreferrer" className="text-[9px] text-turquoise-dim font-bold hover:underline block mt-1">
-                {cell.url.includes("/search") || cell.url.includes("/s?") ? "Search →" : "View →"}
+                {cell.url.includes("/search") || cell.url.includes("/s?") || !cell.price ? "Search →" : "View →"}
               </a>
             )}
           </td>
@@ -131,6 +131,20 @@ function ShopRow({ product }: { product: ComparisonProduct }) {
 export function NaarShopCompareTable() {
   const { data, isLoading, isError, error, refetch, isFetching } = useComparisonMatrix();
   const { data: sellerData } = useSellers();
+  const runScan = useRunScan();
+
+  const hasCompetitorData = (data?.products || []).some((p) => {
+    const c = p.channels;
+    return Boolean(
+      c.amazon?.price ||
+        c.flipkart?.price ||
+        c.meesho?.price ||
+        c.amazon?.url ||
+        c.flipkart?.url ||
+        c.meesho?.url ||
+        (c.sellers && c.sellers.length > 0),
+    );
+  });
 
   return (
     <div className="space-y-4">
@@ -146,10 +160,34 @@ export function NaarShopCompareTable() {
             vs Amazon · Flipkart · Meesho · {sellerData?.count ?? 0} seller sites
           </p>
         </div>
-        <button onClick={() => refetch()} disabled={isFetching} className="btn-naar-primary shrink-0">
-          {isFetching ? "Syncing…" : "↻ Sync prices"}
-        </button>
+        <div className="flex flex-wrap gap-2 shrink-0">
+          <button onClick={() => refetch()} disabled={isFetching} className="btn-naar-secondary shrink-0">
+            {isFetching ? "Refreshing…" : "↻ Refresh"}
+          </button>
+          <button
+            onClick={() => runScan.mutate()}
+            disabled={runScan.isPending}
+            className="btn-naar-primary shrink-0"
+          >
+            {runScan.isPending ? "Starting scan…" : "▶ Run competitor scan"}
+          </button>
+        </div>
       </div>
+
+      {runScan.isSuccess && (
+        <div className="naar-card px-4 py-3 text-sm border-turquoise/30 bg-turquoise/8 text-forest">
+          {runScan.data?.message ||
+            "Competitor scan started. Refresh in a few minutes to see Amazon, Flipkart and Meesho prices."}
+        </div>
+      )}
+
+      {!isLoading && data?.products?.length && !hasCompetitorData && (
+        <div className="naar-card px-4 py-3 text-sm border-naar-honey/30 bg-naar-honey/10 text-forest">
+          <strong>Naar prices are loaded</strong>, but competitor columns are empty until you run a scan. Click{" "}
+          <strong>Run competitor scan</strong> above — it searches Amazon, Flipkart and Meesho for each product (takes 2–5
+          minutes on Render).
+        </div>
+      )}
 
       {isError && (
         <div className="naar-card px-4 py-3 text-sm border-naar-red/30 bg-naar-red/8 text-forest">
@@ -193,7 +231,7 @@ export function NaarShopCompareTable() {
                   <td colSpan={7} className="px-4 py-16 text-center text-naar-warm space-y-2">
                     <p>No products in database yet.</p>
                     <p className="text-sm">
-                      On the dashboard, click <strong>Sync Naar Catalog</strong> first, then <strong>Run Full Scan</strong>.
+                      Click <strong>Run competitor scan</strong> above to fetch Amazon, Flipkart and Meesho prices.
                     </p>
                     <p className="text-xs">
                       If sync fails, set <code>NAAR_CATALOG_API</code> in the project <code>.env</code> (or Render env) and run <strong>Sync Naar Catalog</strong>.
