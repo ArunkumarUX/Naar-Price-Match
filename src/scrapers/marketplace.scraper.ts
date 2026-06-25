@@ -56,9 +56,11 @@ function searchFallback(platform: string, query: string): ScrapeCandidate[] {
 
 async function searchPlatform(platform: "amazon" | "flipkart" | "meesho", query: string, maxResults = 3): Promise<ScrapeCandidate[]> {
   try {
-    const playwrightResults = await playwrightSearchPlatform(platform, query, maxResults);
-    if (playwrightResults.length) {
-      return playwrightResults.slice(0, maxResults);
+    if (config.USE_PLAYWRIGHT) {
+      const playwrightResults = await playwrightSearchPlatform(platform, query, maxResults);
+      if (playwrightResults.length) {
+        return playwrightResults.slice(0, maxResults);
+      }
     }
 
     const url = searchUrl(platform, query);

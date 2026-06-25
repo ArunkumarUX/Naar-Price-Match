@@ -42,7 +42,7 @@ export async function reportsRoutes(app: FastifyInstance) {
       status: "started",
       limit,
       message:
-        "Competitor price scan started in the background. Amazon, Flipkart and Meesho are scraped with Playwright — refresh the compare page in 2–5 minutes.",
+        "Competitor price scan started. Search links appear within ~1 minute; set USE_PLAYWRIGHT=true on Render for live scraping.",
     };
   });
 

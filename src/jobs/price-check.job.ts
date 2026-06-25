@@ -138,7 +138,9 @@ export async function runFullPriceCheck(limit = 10) {
     markScanFailed(message);
     throw err;
   } finally {
-    await closeSharedBrowser();
+    if (config.USE_PLAYWRIGHT) {
+      await closeSharedBrowser();
+    }
   }
 
   markScanDone(count, scanned);

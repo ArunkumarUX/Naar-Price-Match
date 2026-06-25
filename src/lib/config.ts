@@ -22,6 +22,7 @@ const envSchema = z.object({
   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: z.string().optional().default(""),
   BRIGHTDATA_PROXY: z.string().optional().default(""),
   SCRAPERAPI_KEY: z.string().optional().default(""),
+  USE_PLAYWRIGHT: z.coerce.boolean().default(false),
   SKIP_SELLER_SCAN: z.coerce.boolean().default(false),
   SELLER_SCAN_LIMIT: z.coerce.number().default(3),
   SENDGRID_API_KEY: z.string().optional().default(""),

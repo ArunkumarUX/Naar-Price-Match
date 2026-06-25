@@ -26,6 +26,8 @@ services:
         value: Xenova/all-MiniLM-L6-v2
       - key: USE_EMBEDDINGS
         value: "false"
+      - key: USE_PLAYWRIGHT
+        value: "false"
       - key: MIN_MATCH_CONFIDENCE
         value: "0.45"
       - key: SKIP_SELLER_SCAN
@@ -73,6 +75,8 @@ services:
       - key: EMBEDDING_MODEL
         value: Xenova/all-MiniLM-L6-v2
       - key: USE_EMBEDDINGS
+        value: "false"
+      - key: USE_PLAYWRIGHT
         value: "false"
       - key: MIN_MATCH_CONFIDENCE
         value: "0.45"
