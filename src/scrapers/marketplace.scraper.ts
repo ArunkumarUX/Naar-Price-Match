@@ -63,6 +63,10 @@ async function searchPlatform(platform: "amazon" | "flipkart" | "meesho", query:
       }
     }
 
+    if (!config.SCRAPERAPI_KEY) {
+      return searchFallback(platform, query);
+    }
+
     const url = searchUrl(platform, query);
     const html = await fetchHtml(url);
     if (!html) {
