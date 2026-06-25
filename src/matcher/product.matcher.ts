@@ -81,6 +81,7 @@ export async function matchProduct(
   for (const candidate of candidates) {
     let score = 0;
     let method = "no_match";
+    let fuseScore = 0;
 
     const nSku = normalizeSku(naar.sku);
     const cSku = normalizeSku(candidate.sku ?? candidate.platformId ?? "");
@@ -90,7 +91,7 @@ export async function matchProduct(
     } else {
       const fuse = new Fuse([candidate], { keys: ["title"], includeScore: true });
       const fuseResult = fuse.search(naar.name);
-      const fuseScore = fuseResult[0] ? 1 - (fuseResult[0].score ?? 1) : 0;
+      fuseScore = fuseResult[0] ? 1 - (fuseResult[0].score ?? 1) : 0;
 
       if (fuseScore >= 0.55) {
         method = "title_fuzzy";
@@ -113,7 +114,13 @@ export async function matchProduct(
       }
     }
 
-    if (score >= minConfidence) {
+    const effectiveMin = candidate.is_search_link ? Math.min(minConfidence, 0.35) : minConfidence;
+    if (candidate.is_search_link && fuseScore >= 0.35) {
+      score = Math.max(score, 0.5);
+      method = "search_link";
+    }
+
+    if (score >= effectiveMin) {
       results.push({
         candidate,
         score: Math.round(score * 10_000) / 10_000,

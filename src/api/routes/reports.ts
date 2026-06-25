@@ -1,6 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import { createPriceCheckQueue, createRedisConnection } from "../../jobs/queue.js";
-import { runFullPriceCheck } from "../../jobs/price-check.job.js";
+import { getScanStatus, runFullPriceCheck } from "../../jobs/price-check.job.js";
 import { syncNaarCatalog } from "../../services/catalog.js";
 
 export async function reportsRoutes(app: FastifyInstance) {
@@ -27,6 +27,8 @@ export async function reportsRoutes(app: FastifyInstance) {
       };
     }
   });
+
+  app.get("/scan-status", async () => getScanStatus());
 
   app.post("/run-scan", async (req) => {
     const q = req.query as { limit?: string };

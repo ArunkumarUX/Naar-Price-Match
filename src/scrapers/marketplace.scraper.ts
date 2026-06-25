@@ -1,5 +1,6 @@
 import axios from "axios";
 import { config } from "../lib/config.js";
+import { marketplaceSearchUrl } from "./marketplace.urls.js";
 import { playwrightSearchPlatform } from "./marketplace.playwright.js";
 
 export interface ScrapeCandidate {
@@ -12,10 +13,10 @@ export interface ScrapeCandidate {
 }
 
 function searchUrl(platform: string, query: string): string {
+  if (platform === "amazon" || platform === "flipkart" || platform === "meesho") {
+    return marketplaceSearchUrl(platform, query);
+  }
   const q = encodeURIComponent(query);
-  if (platform === "amazon") return `https://www.amazon.in/s?k=${q}`;
-  if (platform === "flipkart") return `https://www.flipkart.com/search?q=${q}`;
-  if (platform === "meesho") return `https://www.meesho.com/search?q=${q}`;
   return `https://www.google.com/search?q=${q}`;
 }
 
@@ -54,31 +55,35 @@ function searchFallback(platform: string, query: string): ScrapeCandidate[] {
 }
 
 async function searchPlatform(platform: "amazon" | "flipkart" | "meesho", query: string, maxResults = 3): Promise<ScrapeCandidate[]> {
-  const playwrightResults = await playwrightSearchPlatform(platform, query, maxResults);
-  if (playwrightResults.length) {
-    return playwrightResults.slice(0, maxResults);
-  }
+  try {
+    const playwrightResults = await playwrightSearchPlatform(platform, query, maxResults);
+    if (playwrightResults.length) {
+      return playwrightResults.slice(0, maxResults);
+    }
 
-  const url = searchUrl(platform, query);
-  const html = await fetchHtml(url);
-  if (!html) {
+    const url = searchUrl(platform, query);
+    const html = await fetchHtml(url);
+    if (!html) {
+      return searchFallback(platform, query);
+    }
+
+    const price = extractFirstPrice(html);
+    if (!price) {
+      return searchFallback(platform, query);
+    }
+
+    return [
+      {
+        title: query,
+        price,
+        url,
+        is_search_link: true,
+        platformId: `${platform}-search`,
+      },
+    ].slice(0, maxResults);
+  } catch {
     return searchFallback(platform, query);
   }
-
-  const price = extractFirstPrice(html);
-  if (!price) {
-    return searchFallback(platform, query);
-  }
-
-  return [
-    {
-      title: query,
-      price,
-      url,
-      is_search_link: true,
-      platformId: `${platform}-search`,
-    },
-  ].slice(0, maxResults);
 }
 
 export async function searchAmazon(query: string, maxResults = 3) {

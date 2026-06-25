@@ -4,6 +4,34 @@ import { prisma } from "../../lib/prisma.js";
 import { normalizeNaarProductUrl } from "../../lib/naar-url.js";
 import { loadSellers, sellerCount } from "../../scrapers/seller.registry.js";
 
+type ListingWithSnapshots = {
+  platform: string;
+  platformUrl: string;
+  matchConfidence: number;
+  matchMethod: string;
+  sellerName: string | null;
+  snapshots: { price: number; capturedAt: Date }[];
+};
+
+function pickBestListing(listings: ListingWithSnapshots[], platform: string) {
+  const candidates = listings.filter((l) => l.platform === platform);
+  if (!candidates.length) return null;
+
+  return candidates
+    .map((listing) => {
+      const latest = listing.snapshots.sort((a, b) => b.capturedAt.getTime() - a.capturedAt.getTime())[0];
+      return { listing, latest };
+    })
+    .sort((a, b) => {
+      const aPrice = a.latest?.price && a.latest.price > 0 ? 1 : 0;
+      const bPrice = b.latest?.price && b.latest.price > 0 ? 1 : 0;
+      if (aPrice !== bPrice) return bPrice - aPrice;
+      const aTime = a.latest?.capturedAt.getTime() ?? 0;
+      const bTime = b.latest?.capturedAt.getTime() ?? 0;
+      return bTime - aTime;
+    })[0];
+}
+
 function productFromDb(
   product: {
     sku: string;
@@ -23,23 +51,32 @@ function productFromDb(
 ) {
   const matches: Record<string, unknown> = { amazon: null, flipkart: null, meesho: null, sellers: [] as unknown[] };
 
-  for (const listing of product.listings) {
+  for (const platform of ["amazon", "flipkart", "meesho"] as const) {
+    const picked = pickBestListing(product.listings, platform);
+    if (!picked) continue;
+    const { listing, latest } = picked;
+    const price = latest?.price && latest.price > 0 ? latest.price : null;
+    matches[platform] = {
+      price,
+      url: listing.platformUrl,
+      match_score: listing.matchConfidence,
+      match_method: listing.matchMethod,
+      title: product.name,
+      is_search_link: listing.matchMethod.includes("search") || listing.platformUrl.includes("/search") || listing.platformUrl.includes("/s?"),
+    };
+  }
+
+  for (const listing of product.listings.filter((l) => l.platform === "seller")) {
     const latest = listing.snapshots.sort((a, b) => b.capturedAt.getTime() - a.capturedAt.getTime())[0];
     const price = latest?.price && latest.price > 0 ? latest.price : null;
-    const entry = {
+    (matches.sellers as unknown[]).push({
       price,
       url: listing.platformUrl,
       match_score: listing.matchConfidence,
       match_method: listing.matchMethod,
       title: product.name,
       seller_name: listing.sellerName,
-    };
-
-    if (listing.platform === "seller") {
-      (matches.sellers as unknown[]).push(entry);
-    } else {
-      matches[listing.platform] = entry;
-    }
+    });
   }
 
   const row = {
@@ -66,6 +103,7 @@ function productFromDb(
       continue;
     }
     const ch = classifyChannel(product.basePrice, match.price ? Number(match.price) : null);
+    const hasUrl = Boolean(match.url);
     row.channels[platform] = {
       platform,
       price: match.price,
@@ -73,6 +111,9 @@ function productFromDb(
       match_confidence: match.match_score,
       match_method: match.match_method,
       ...ch,
+      ...(hasUrl && !match.price
+        ? { status: "pending", label: "Search link", deviation_pct: null }
+        : {}),
     };
   }
 

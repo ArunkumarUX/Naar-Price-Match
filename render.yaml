@@ -27,7 +27,11 @@ services:
       - key: USE_EMBEDDINGS
         value: "false"
       - key: MIN_MATCH_CONFIDENCE
-        value: "0.75"
+        value: "0.45"
+      - key: SKIP_SELLER_SCAN
+        value: "true"
+      - key: SELLER_SCAN_LIMIT
+        value: "0"
       - key: MAX_PRICE_DEVIATION_PCT
         value: "5"
       - key: NAAR_BASE_URL
@@ -71,7 +75,11 @@ services:
       - key: USE_EMBEDDINGS
         value: "false"
       - key: MIN_MATCH_CONFIDENCE
-        value: "0.75"
+        value: "0.45"
+      - key: SKIP_SELLER_SCAN
+        value: "true"
+      - key: SELLER_SCAN_LIMIT
+        value: "0"
       - key: MAX_PRICE_DEVIATION_PCT
         value: "5"
       - key: NAAR_BASE_URL

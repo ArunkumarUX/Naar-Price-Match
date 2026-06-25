@@ -22,6 +22,8 @@ const envSchema = z.object({
   PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: z.string().optional().default(""),
   BRIGHTDATA_PROXY: z.string().optional().default(""),
   SCRAPERAPI_KEY: z.string().optional().default(""),
+  SKIP_SELLER_SCAN: z.coerce.boolean().default(false),
+  SELLER_SCAN_LIMIT: z.coerce.number().default(3),
   SENDGRID_API_KEY: z.string().optional().default(""),
   ALERT_EMAIL_FROM: z.string().default("alerts@naar.io"),
   ALERT_EMAIL_TO: z.string().default("pricing@naar.io"),

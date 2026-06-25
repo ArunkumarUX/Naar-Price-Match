@@ -1,6 +1,6 @@
 "use client";
 
-import { useComparisonMatrix, useRunScan, useSellers, type ComparisonProduct } from "@/lib/api";
+import { useComparisonMatrix, useRunScan, useScanStatus, useSellers, type ComparisonProduct } from "@/lib/api";
 import { parityStatus } from "@/lib/brand";
 import { normalizeNaarProductUrl } from "@/lib/naar-url";
 
@@ -131,6 +131,7 @@ function ShopRow({ product }: { product: ComparisonProduct }) {
 export function NaarShopCompareTable() {
   const { data, isLoading, isError, error, refetch, isFetching } = useComparisonMatrix();
   const { data: sellerData } = useSellers();
+  const { data: scanStatus } = useScanStatus();
   const runScan = useRunScan();
 
   const hasCompetitorData = (data?.products || []).some((p) => {
@@ -177,15 +178,26 @@ export function NaarShopCompareTable() {
       {runScan.isSuccess && (
         <div className="naar-card px-4 py-3 text-sm border-turquoise/30 bg-turquoise/8 text-forest">
           {runScan.data?.message ||
-            "Competitor scan started. Refresh in a few minutes to see Amazon, Flipkart and Meesho prices."}
+            "Competitor scan started. Amazon/Flipkart/Meesho links appear within ~1 minute; live prices may take longer."}
+        </div>
+      )}
+
+      {scanStatus?.phase === "running" && (
+        <div className="naar-card px-4 py-3 text-sm border-turquoise/30 bg-turquoise/8 text-forest">
+          Scanning competitors… {scanStatus.scanned}/{scanStatus.total} products processed. Refresh to see new links.
+        </div>
+      )}
+
+      {scanStatus?.phase === "failed" && (
+        <div className="naar-card px-4 py-3 text-sm border-naar-red/30 bg-naar-red/8 text-forest">
+          Last scan failed: {scanStatus.error || "unknown error"}
         </div>
       )}
 
       {!isLoading && data?.products?.length && !hasCompetitorData && (
         <div className="naar-card px-4 py-3 text-sm border-naar-honey/30 bg-naar-honey/10 text-forest">
           <strong>Naar prices are loaded</strong>, but competitor columns are empty until you run a scan. Click{" "}
-          <strong>Run competitor scan</strong> above — it searches Amazon, Flipkart and Meesho for each product (takes 2–5
-          minutes on Render).
+          <strong>Run competitor scan</strong> above — search links appear within about a minute; live prices can take longer on Render.
         </div>
       )}
 

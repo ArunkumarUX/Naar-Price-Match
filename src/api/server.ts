@@ -44,7 +44,7 @@ app.get("/health", async () => ({
   demo_mode: config.DEMO_MODE,
   production_mode: isProduction,
   claude_enabled: false,
-  embedding_enabled: true,
+  embedding_enabled: config.USE_EMBEDDINGS,
   embedding_model: config.EMBEDDING_MODEL,
   claude_model: null,
 }));

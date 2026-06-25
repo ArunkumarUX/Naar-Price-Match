@@ -32,6 +32,7 @@ export const parityStatus = {
   higher: { bg: "bg-naar-pumpkin/12", text: "text-naar-pumpkin", label: "Higher" },
   violation: { bg: "bg-naar-violet/12", text: "text-naar-violet", label: "Violation" },
   missing: { bg: "bg-naar-mist", text: "text-naar-warm", label: "Unmatched" },
+  pending: { bg: "bg-turquoise/12", text: "text-turquoise-dim", label: "Search link" },
 } as const;
 
 export const categoryColors: Record<string, string> = {

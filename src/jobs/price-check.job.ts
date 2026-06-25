@@ -1,14 +1,59 @@
 import { buildComparisonRow } from "../engine/price.comparator.js";
-import { matchProduct, toMatchedListing } from "../matcher/product.matcher.js";
+import { matchProduct, toMatchedListing, type MatchCandidate } from "../matcher/product.matcher.js";
+import { marketplaceSearchFallback } from "../scrapers/marketplace.urls.js";
 import { searchAmazon, searchFlipkart, searchMeesho } from "../scrapers/marketplace.scraper.js";
 import { closeSharedBrowser } from "../scrapers/playwright.util.js";
 import { searchSellers } from "../scrapers/seller.registry.js";
 import { config } from "../lib/config.js";
 import { prisma } from "../lib/prisma.js";
 import { syncNaarCatalog } from "../services/catalog.js";
-import type { MatchCandidate } from "../matcher/product.matcher.js";
+import {
+  getScanStatus,
+  markScanDone,
+  markScanFailed,
+  markScanProgress,
+  markScanStarted,
+} from "./scan-status.js";
+
+type Platform = "amazon" | "flipkart" | "meesho";
+
+const PLATFORM_SEARCHERS = {
+  amazon: searchAmazon,
+  flipkart: searchFlipkart,
+  meesho: searchMeesho,
+} as const;
+
+async function resolvePlatformMatch(
+  platform: Platform,
+  naarProduct: { sku: string; name: string; variant?: string },
+  search: (query: string, max: number) => Promise<MatchCandidate[]>,
+) {
+  try {
+    const candidates = (await search(naarProduct.name, 3)) as MatchCandidate[];
+    const matched = await matchProduct(naarProduct, candidates, config.MIN_MATCH_CONFIDENCE);
+    if (matched[0]) return toMatchedListing(matched[0]);
+
+    if (candidates[0]) {
+      return {
+        ...candidates[0],
+        match_score: 0.4,
+        match_method: "unverified",
+      };
+    }
+  } catch {
+    /* fall through to search link */
+  }
+
+  return {
+    ...marketplaceSearchFallback(platform, naarProduct.name),
+    match_score: 0.35,
+    match_method: "search_fallback",
+  };
+}
 
 export async function runFullPriceCheck(limit = 10) {
+  markScanStarted(limit);
+
   let dbProducts = await prisma.product.findMany({
     where: { isActive: true },
     take: limit,
@@ -18,6 +63,7 @@ export async function runFullPriceCheck(limit = 10) {
   if (!dbProducts.length) {
     const catalog = await syncNaarCatalog();
     if (!catalog.imported) {
+      markScanFailed("Naar catalog empty — sync catalog first.");
       return {
         scanned: 0,
         skus: [] as string[],
@@ -47,36 +93,59 @@ export async function runFullPriceCheck(limit = 10) {
       };
 
       const matches: Record<string, unknown> = {};
-      for (const [platform, search] of [
-        ["amazon", searchAmazon],
-        ["flipkart", searchFlipkart],
-        ["meesho", searchMeesho],
-      ] as const) {
-        const candidates = await search(product.name, 3);
-        const matched = await matchProduct(naarProduct, candidates as MatchCandidate[], config.MIN_MATCH_CONFIDENCE);
-        matches[platform] = matched[0] ? toMatchedListing(matched[0]) : null;
+      for (const platform of ["amazon", "flipkart", "meesho"] as const) {
+        const search = PLATFORM_SEARCHERS[platform] as (query: string, max: number) => Promise<MatchCandidate[]>;
+        matches[platform] = await resolvePlatformMatch(platform, naarProduct, search);
       }
 
-      const sellerCandidates = await searchSellers(product.name, 8);
-      const sellerMatched = await matchProduct(
-        naarProduct,
-        sellerCandidates as MatchCandidate[],
-        config.MIN_MATCH_CONFIDENCE - 0.1,
-      );
-      matches.sellers = sellerMatched.slice(0, 5).map(toMatchedListing);
+      // Persist marketplace data immediately so refresh shows links/prices while sellers run.
+      const partialRow = buildComparisonRow(naarProduct, matches);
+      await persistComparisonRow(product.sku, partialRow);
 
-      const row = buildComparisonRow(naarProduct, matches);
-      await persistComparisonRow(product.sku, row);
+      if (!config.SKIP_SELLER_SCAN && config.SELLER_SCAN_LIMIT > 0) {
+        try {
+          const sellerCandidates = await searchSellers(product.name, config.SELLER_SCAN_LIMIT);
+          const sellerMatched = await matchProduct(
+            naarProduct,
+            sellerCandidates as MatchCandidate[],
+            Math.max(0.35, config.MIN_MATCH_CONFIDENCE - 0.15),
+          );
+          matches.sellers =
+            sellerMatched.length > 0
+              ? sellerMatched.slice(0, 5).map(toMatchedListing)
+              : sellerCandidates.slice(0, 3).map((c) => ({
+                  ...c,
+                  match_score: 0.3,
+                  match_method: "seller_unverified",
+                }));
+
+          const fullRow = buildComparisonRow(naarProduct, matches);
+          await persistComparisonRow(product.sku, fullRow);
+        } catch {
+          /* marketplace data already saved */
+        }
+      } else {
+        matches.sellers = [];
+      }
+
       scanned.push(product.sku);
       count++;
+      markScanProgress(count, product.sku);
       if (count >= limit) break;
     }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Price scan failed";
+    markScanFailed(message);
+    throw err;
   } finally {
     await closeSharedBrowser();
   }
 
+  markScanDone(count, scanned);
   return { scanned: count, skus: scanned };
 }
+
+export { getScanStatus };
 
 async function persistComparisonRow(sku: string, row: Record<string, unknown>) {
   const product = await prisma.product.findUnique({ where: { sku } });
@@ -98,27 +167,52 @@ async function persistComparisonRow(sku: string, row: Record<string, unknown>) {
 
 async function saveListingSnapshot(
   productId: string,
-  platform: "amazon" | "flipkart" | "meesho" | "seller",
+  platform: Platform | "seller",
   ch: Record<string, unknown>,
   sellerName?: string,
 ) {
-  const listing = await prisma.productListing.create({
-    data: {
+  const platformUrl = String(ch.url ?? "");
+  if (!platformUrl) return;
+
+  const platformId = String(ch.platformId ?? ch.seller_id ?? platform);
+  const matchConfidence = Number(ch.match_confidence ?? ch.match_score ?? 0);
+  const matchMethod = String(ch.match_method ?? "unknown");
+  const price = Number(ch.price ?? 0) || 0;
+
+  let listing = await prisma.productListing.findFirst({
+    where: {
       productId,
       platform,
-      platformId: String(ch.platformId ?? ch.seller_id ?? platform),
-      sellerName: sellerName || null,
-      platformUrl: String(ch.url ?? ""),
-      matchConfidence: Number(ch.match_confidence ?? 0),
-      matchMethod: String(ch.match_method ?? "unknown"),
+      platformUrl,
+      ...(sellerName ? { sellerName } : {}),
     },
+    orderBy: { createdAt: "desc" },
   });
+
+  if (!listing) {
+    listing = await prisma.productListing.create({
+      data: {
+        productId,
+        platform,
+        platformId,
+        sellerName: sellerName || null,
+        platformUrl,
+        matchConfidence,
+        matchMethod,
+      },
+    });
+  } else {
+    listing = await prisma.productListing.update({
+      where: { id: listing.id },
+      data: { matchConfidence, matchMethod, platformId },
+    });
+  }
 
   await prisma.priceSnapshot.create({
     data: {
       productId,
       listingId: listing.id,
-      price: Number(ch.price ?? 0) || 0,
+      price,
       inStock: true,
     },
   });

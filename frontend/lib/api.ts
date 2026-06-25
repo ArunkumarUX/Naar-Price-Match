@@ -147,9 +147,31 @@ export const useRunScan = () => {
       qc.invalidateQueries({ queryKey: ["alert-summary"] });
       qc.invalidateQueries({ queryKey: ["products"] });
       qc.invalidateQueries({ queryKey: ["comparison"] });
+      qc.invalidateQueries({ queryKey: ["scan-status"] });
     },
   });
 };
+
+export interface ScanStatus {
+  phase: "idle" | "running" | "done" | "failed";
+  startedAt: string | null;
+  finishedAt: string | null;
+  scanned: number;
+  total: number;
+  skus: string[];
+  error: string | null;
+}
+
+export const useScanStatus = () =>
+  useQuery<ScanStatus>({
+    queryKey: ["scan-status"],
+    queryFn: async () => {
+      const res = await fetch(`${BASE}/reports/scan-status`, { cache: "no-store" });
+      if (!res.ok) throw new Error("Failed to fetch scan status");
+      return res.json();
+    },
+    refetchInterval: (query) => (query.state.data?.phase === "running" ? 5_000 : 30_000),
+  });
 
 export const useSyncCatalog = () => {
   const qc = useQueryClient();
