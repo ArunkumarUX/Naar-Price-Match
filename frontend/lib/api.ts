@@ -1,7 +1,14 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 
-/** Browser uses same-origin runtime proxy; SSR uses direct backend URL. */
-export const API_BASE = typeof window !== "undefined" ? "/backend-api" : getServerApiBase();
+/** Browser uses direct API in production to avoid proxy timeouts. */
+export const API_BASE = typeof window !== "undefined" ? getBrowserApiBase() : getServerApiBase();
+
+function getBrowserApiBase(): string {
+  const envUrl = process.env.NEXT_PUBLIC_API_URL?.replace(/\/$/, "");
+  if (envUrl) return envUrl;
+  if (process.env.NODE_ENV === "production") return "https://naar-api.onrender.com";
+  return "/backend-api";
+}
 
 function getServerApiBase(): string {
   return (
