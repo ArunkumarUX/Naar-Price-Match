@@ -32,6 +32,13 @@ const envSchema = z.object({
   CORS_ORIGIN: z.string().default("http://localhost:3000"),
 });
 
-export const config = envSchema.parse(process.env);
+const parsed = envSchema.parse(process.env);
+
+export const config = {
+  ...parsed,
+  USE_EMBEDDINGS: parsed.NODE_ENV === "production" ? false : parsed.USE_EMBEDDINGS,
+  USE_PLAYWRIGHT: parsed.NODE_ENV === "production" ? false : parsed.USE_PLAYWRIGHT,
+  SKIP_SELLER_SCAN: parsed.NODE_ENV === "production" ? true : parsed.SKIP_SELLER_SCAN,
+};
 
 export const isProduction = config.NODE_ENV === "production" && !config.DEMO_MODE;
