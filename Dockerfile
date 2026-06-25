@@ -3,10 +3,11 @@ FROM node:22-alpine
 WORKDIR /app
 
 # System Chromium for Playwright (no `playwright install --with-deps` needed)
-RUN apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefont
+RUN apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefont libc6-compat gcompat
 
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium-browser
+ENV TRANSFORMERS_BACKEND=wasm
 ENV NODE_ENV=production
 
 # Prisma postinstall needs schema before `npm install`

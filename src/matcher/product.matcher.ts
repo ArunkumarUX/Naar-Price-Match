@@ -3,11 +3,18 @@ import { config } from "../lib/config.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let embedder: any = null;
+let embeddingUnavailable = false;
 
 async function getEmbedder() {
+  if (embeddingUnavailable) return null;
   if (!embedder) {
-    const { pipeline } = await import("@xenova/transformers");
-    embedder = await pipeline("feature-extraction", config.EMBEDDING_MODEL);
+    try {
+      const { pipeline } = await import("@xenova/transformers");
+      embedder = await pipeline("feature-extraction", config.EMBEDDING_MODEL);
+    } catch {
+      embeddingUnavailable = true;
+      return null;
+    }
   }
   return embedder;
 }
@@ -47,6 +54,7 @@ function cosineSimilarity(a: number[], b: number[]): number {
 
 async function embed(text: string): Promise<number[]> {
   const model = await getEmbedder();
+  if (!model) return [];
   const output = await model(text, { pooling: "mean", normalize: true });
   return Array.from(output.data as Float32Array);
 }
@@ -91,12 +99,16 @@ export async function matchProduct(
           embed(naar.name),
           embed(candidate.title ?? ""),
         ]);
-        const cosine = cosineSimilarity(embN, embC);
-        const variantBoost = variantMatch(naar.variant, candidate.title ?? "") ? 0.1 : 0;
-
-        const embeddingScore = Math.min(1, cosine + variantBoost);
-        method = embeddingScore > fuseScore * 0.8 ? "embedding" : "title_fuzzy";
-        score = Math.max(embeddingScore, fuseScore * 0.8);
+        if (!embN.length || !embC.length) {
+          method = "title_fuzzy";
+          score = fuseScore;
+        } else {
+          const cosine = cosineSimilarity(embN, embC);
+          const variantBoost = variantMatch(naar.variant, candidate.title ?? "") ? 0.1 : 0;
+          const embeddingScore = Math.min(1, cosine + variantBoost);
+          method = embeddingScore > fuseScore * 0.8 ? "embedding" : "title_fuzzy";
+          score = Math.max(embeddingScore, fuseScore * 0.8);
+        }
       }
     }
 
