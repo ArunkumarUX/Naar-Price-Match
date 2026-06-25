@@ -6,6 +6,7 @@ let embedder: any = null;
 let embeddingUnavailable = false;
 
 async function getEmbedder() {
+  if (!config.USE_EMBEDDINGS) return null;
   if (embeddingUnavailable) return null;
   if (!embedder) {
     try {

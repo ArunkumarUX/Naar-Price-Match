@@ -24,6 +24,8 @@ services:
           property: connectionString
       - key: EMBEDDING_MODEL
         value: Xenova/all-MiniLM-L6-v2
+      - key: USE_EMBEDDINGS
+        value: "false"
       - key: MIN_MATCH_CONFIDENCE
         value: "0.75"
       - key: MAX_PRICE_DEVIATION_PCT
@@ -66,6 +68,8 @@ services:
           property: connectionString
       - key: EMBEDDING_MODEL
         value: Xenova/all-MiniLM-L6-v2
+      - key: USE_EMBEDDINGS
+        value: "false"
       - key: MIN_MATCH_CONFIDENCE
         value: "0.75"
       - key: MAX_PRICE_DEVIATION_PCT

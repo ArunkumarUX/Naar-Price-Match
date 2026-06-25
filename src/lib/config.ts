@@ -7,6 +7,7 @@ const envSchema = z.object({
   DATABASE_URL: z.string().default("postgresql://user:password@localhost:5432/naar_monitor"),
   REDIS_URL: z.string().default("redis://localhost:6379"),
   EMBEDDING_MODEL: z.string().default("Xenova/all-MiniLM-L6-v2"),
+  USE_EMBEDDINGS: z.coerce.boolean().default(false),
   MIN_MATCH_CONFIDENCE: z.coerce.number().default(0.75),
   MAX_PRICE_DEVIATION_PCT: z.coerce.number().default(5),
   CRITICAL_DEVIATION_PCT: z.coerce.number().default(20),
