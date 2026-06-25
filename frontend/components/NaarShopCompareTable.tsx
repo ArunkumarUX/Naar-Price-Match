@@ -147,6 +147,13 @@ export function NaarShopCompareTable() {
     );
   });
 
+  const hasLivePrices = (data?.products || []).some((p) => {
+    const c = p.channels;
+    return Boolean(c.amazon?.price || c.flipkart?.price || c.meesho?.price);
+  });
+
+  const hasSearchLinksOnly = hasCompetitorData && !hasLivePrices;
+
   return (
     <div className="space-y-4">
       <div className="naar-card-dark p-5 flex flex-wrap items-center justify-between gap-4">
@@ -191,6 +198,14 @@ export function NaarShopCompareTable() {
       {scanStatus?.phase === "failed" && (
         <div className="naar-card px-4 py-3 text-sm border-naar-red/30 bg-naar-red/8 text-forest">
           Last scan failed: {scanStatus.error || "unknown error"}
+        </div>
+      )}
+
+      {hasSearchLinksOnly && (
+        <div className="naar-card px-4 py-3 text-sm border-naar-honey/30 bg-naar-honey/10 text-forest">
+          <strong>Search links are live.</strong> For automatic ₹ prices on Render, add{" "}
+          <strong>SCRAPERAPI_KEY</strong> in your Render environment (recommended). Playwright on the free tier
+          tends to crash the API — ScraperAPI is the best option.
         </div>
       )}
 

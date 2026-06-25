@@ -6,6 +6,7 @@ import { productsRoutes } from "./routes/products.js";
 import { reportsRoutes } from "./routes/reports.js";
 import { config, isProduction } from "../lib/config.js";
 import { startCatalogSyncScheduler } from "../jobs/catalog-sync.scheduler.js";
+import { competitorScrapeSummary } from "../lib/scrape-mode.js";
 
 const app = Fastify({ logger: true });
 
@@ -39,15 +40,22 @@ app.get("/", async () => ({
   },
 }));
 
-app.get("/health", async () => ({
-  status: "ok",
-  demo_mode: config.DEMO_MODE,
-  production_mode: isProduction,
-  claude_enabled: false,
-  embedding_enabled: config.USE_EMBEDDINGS,
-  embedding_model: config.EMBEDDING_MODEL,
-  claude_model: null,
-}));
+app.get("/health", async () => {
+  const scrape = competitorScrapeSummary();
+  return {
+    status: "ok",
+    demo_mode: config.DEMO_MODE,
+    production_mode: isProduction,
+    claude_enabled: false,
+    embedding_enabled: config.USE_EMBEDDINGS,
+    embedding_model: config.EMBEDDING_MODEL,
+    claude_model: null,
+    scrape_mode: scrape.mode,
+    live_prices_enabled: scrape.live_prices,
+    scraperapi_configured: Boolean(config.SCRAPERAPI_KEY),
+    recommended_live_prices: "scraperapi",
+  };
+});
 
 await app.register(alertsRoutes, { prefix: "/alerts" });
 await app.register(productsRoutes, { prefix: "/products" });

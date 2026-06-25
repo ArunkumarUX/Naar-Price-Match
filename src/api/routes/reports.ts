@@ -2,6 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { createPriceCheckQueue, createRedisConnection } from "../../jobs/queue.js";
 import { getScanStatus, runFullPriceCheck } from "../../jobs/price-check.job.js";
 import { syncNaarCatalog } from "../../services/catalog.js";
+import { competitorScrapeSummary } from "../../lib/scrape-mode.js";
 
 export async function reportsRoutes(app: FastifyInstance) {
   app.post("/sync-catalog", async () => {
@@ -38,11 +39,14 @@ export async function reportsRoutes(app: FastifyInstance) {
       req.log.error({ err }, "Background price scan failed");
     });
 
+    const scrape = competitorScrapeSummary();
+
     return {
       status: "started",
       limit,
-      message:
-        "Competitor price scan started. Search links appear within ~1 minute; set USE_PLAYWRIGHT=true on Render for live scraping.",
+      scrape_mode: scrape.mode,
+      live_prices: scrape.live_prices,
+      message: scrape.scan_message,
     };
   });
 
