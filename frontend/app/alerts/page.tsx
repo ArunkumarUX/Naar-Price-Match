@@ -6,7 +6,7 @@ import { PageHeader } from "@/components/PageHeader";
 import type { Severity } from "@/lib/api";
 import { useAlerts } from "@/lib/api";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 
 const SEVERITIES: Severity[] = ["critical", "high", "medium", "low"];
 
@@ -30,7 +30,7 @@ function toSeverity(s: string | null): Severity | undefined {
   return SEVERITIES.includes(lower as Severity) ? (lower as Severity) : undefined;
 }
 
-export default function AlertsPage() {
+function AlertsPageContent() {
   const router = useRouter();
   const pathname = usePathname();
   const searchParams = useSearchParams();
@@ -113,5 +113,13 @@ export default function AlertsPage() {
       </div>
       }
     </main>
+  );
+}
+
+export default function AlertsPage() {
+  return (
+    <Suspense fallback={<main className="p-6 max-w-screen-xl mx-auto">Loading alerts...</main>}>
+      <AlertsPageContent />
+    </Suspense>
   );
 }
