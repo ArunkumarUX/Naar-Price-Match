@@ -1,5 +1,6 @@
 "use client";
 
+import { useMemo } from "react";
 import { useComparisonMatrix, useRunScan, useScanStatus, useSellers, type ComparisonProduct } from "@/lib/api";
 import { parityStatus } from "@/lib/brand";
 import { normalizeNaarProductUrl } from "@/lib/naar-url";
@@ -68,8 +69,8 @@ function ShopRow({ product }: { product: ComparisonProduct }) {
   };
 
   return (
-    <tr className="border-t border-naar-mist hover:bg-sandstone/30 transition-colors">
-      <td className="px-4 py-4 align-top min-w-[220px]">
+    <tr className="border-t border-naar-mist group hover:bg-sandstone/30 transition-colors">
+      <td className="px-4 py-4 align-top min-w-[220px] sticky left-0 z-20 bg-cloud/90 backdrop-blur border-r border-naar-mist group-hover:bg-sandstone/30">
         <p className="text-[10px] font-bold uppercase tracking-[0.12em] text-naar-warm">{product.sku}</p>
         <p className="font-extrabold text-forest mt-0.5 leading-snug">{product.name}</p>
         {product.variant && <p className="text-xs text-naar-slate mt-0.5">{product.variant}</p>}
@@ -128,13 +129,26 @@ function ShopRow({ product }: { product: ComparisonProduct }) {
   );
 }
 
-export function NaarShopCompareTable() {
+export function NaarShopCompareTable({ searchTerm, onlyMismatches }: { searchTerm?: string; onlyMismatches?: boolean }) {
   const { data, isLoading, isError, error, refetch, isFetching } = useComparisonMatrix();
   const { data: sellerData } = useSellers();
   const { data: scanStatus } = useScanStatus();
   const runScan = useRunScan();
 
-  const hasCompetitorData = (data?.products || []).some((p) => {
+  const normalizedSearch = searchTerm?.trim().toLowerCase() ?? "";
+  const products = useMemo(() => {
+    const all = data?.products || [];
+    const onlyMismatchesEnabled = Boolean(onlyMismatches);
+
+    return all.filter((p) => {
+      if (onlyMismatchesEnabled && !p.summary?.has_discrepancy) return false;
+      if (!normalizedSearch) return true;
+      const haystack = [p.sku, p.name, p.variant].filter(Boolean).join(" ").toLowerCase();
+      return haystack.includes(normalizedSearch);
+    });
+  }, [data?.products, normalizedSearch, onlyMismatches]);
+
+  const hasCompetitorData = products.some((p) => {
     const c = p.channels;
     return Boolean(
       c.amazon?.price ||
@@ -147,7 +161,7 @@ export function NaarShopCompareTable() {
     );
   });
 
-  const hasLivePrices = (data?.products || []).some((p) => {
+  const hasLivePrices = products.some((p) => {
     const c = p.channels;
     return Boolean(c.amazon?.price || c.flipkart?.price || c.meesho?.price);
   });
@@ -209,7 +223,7 @@ export function NaarShopCompareTable() {
         </div>
       )}
 
-      {!isLoading && data?.products?.length && !hasCompetitorData && (
+      {!isLoading && products.length && !hasCompetitorData && (
         <div className="naar-card px-4 py-3 text-sm border-naar-honey/30 bg-naar-honey/10 text-forest">
           <strong>Naar prices are loaded</strong>, but competitor columns are empty until you run a scan. Click{" "}
           <strong>Run competitor scan</strong> above — search links appear within about a minute; live prices can take longer on Render.
@@ -227,7 +241,9 @@ export function NaarShopCompareTable() {
           <table className="w-full text-sm min-w-[900px]">
             <thead>
               <tr className="bg-sandstone/80 text-left">
-                <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-[0.14em] text-naar-slate">Product</th>
+                <th className="px-4 py-3 text-[10px] font-bold uppercase tracking-[0.14em] text-naar-slate sticky left-0 z-30 bg-sandstone/80 border-r border-naar-mist">
+                  Product
+                </th>
                 {PLATFORMS.map((p) => (
                   <th
                     key={p.key}
@@ -251,9 +267,9 @@ export function NaarShopCompareTable() {
                   </td>
                 </tr>
               ) : (
-                (data?.products || []).map((p) => <ShopRow key={p.sku} product={p} />)
+                products.map((p) => <ShopRow key={p.sku} product={p} />)
               )}
-              {!isLoading && !data?.products?.length && (
+              {!isLoading && !products.length && (
                 <tr>
                   <td colSpan={7} className="px-4 py-16 text-center text-naar-warm space-y-2">
                     <p>No products in database yet.</p>

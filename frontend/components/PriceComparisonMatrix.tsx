@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useComparisonMatrix, useSellers, type ComparisonProduct } from "@/lib/api";
 import { parityStatus } from "@/lib/brand";
 
@@ -99,24 +99,46 @@ function ProductComparisonCard({ product }: { product: ComparisonProduct }) {
   );
 }
 
-export function PriceComparisonMatrix() {
+export function PriceComparisonMatrix({
+  searchTerm,
+  onlyMismatches,
+  showHeader = true,
+}: {
+  searchTerm?: string;
+  onlyMismatches?: boolean;
+  showHeader?: boolean;
+}) {
   const { data, isLoading, isError, error, refetch, isFetching } = useComparisonMatrix();
   const { data: sellerData } = useSellers();
 
+  const normalizedSearch = searchTerm?.trim().toLowerCase() ?? "";
+  const allProducts = data?.products || [];
+  const products = useMemo(() => {
+    const onlyMismatchesEnabled = Boolean(onlyMismatches);
+    return allProducts.filter((p) => {
+      if (onlyMismatchesEnabled && !p.summary?.has_discrepancy) return false;
+      if (!normalizedSearch) return true;
+      const haystack = [p.sku, p.name, p.variant].filter(Boolean).join(" ").toLowerCase();
+      return haystack.includes(normalizedSearch);
+    });
+  }, [allProducts, normalizedSearch, onlyMismatches]);
+
   return (
     <div className="space-y-5">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <div className="naar-eyebrow">Price Intelligence</div>
-          <h2 className="text-xl font-extrabold text-forest">Naar vs Competitors</h2>
-          <p className="text-sm text-naar-slate mt-1">
-            {sellerData?.count ?? 0} seller websites · Amazon · Flipkart · Meesho
-          </p>
+      {showHeader && (
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="naar-eyebrow">Price Intelligence</div>
+            <h2 className="text-xl font-extrabold text-forest">Naar vs Competitors</h2>
+            <p className="text-sm text-naar-slate mt-1">
+              {sellerData?.count ?? 0} seller websites · Amazon · Flipkart · Meesho
+            </p>
+          </div>
+          <button onClick={() => refetch()} disabled={isFetching} className="btn-naar-secondary">
+            {isFetching ? "Refreshing…" : "↻ Refresh"}
+          </button>
         </div>
-        <button onClick={() => refetch()} disabled={isFetching} className="btn-naar-secondary">
-          {isFetching ? "Refreshing…" : "↻ Refresh"}
-        </button>
-      </div>
+      )}
 
       {isError && (
         <div className="naar-card px-4 py-3 text-sm border-naar-red/30 bg-naar-red/8 text-forest">
@@ -129,12 +151,12 @@ export function PriceComparisonMatrix() {
         <div className="text-center py-16 text-naar-warm">Loading price comparison…</div>
       ) : (
         <div className="space-y-4">
-          {(data?.products || []).map((p) => (
+          {products.map((p) => (
             <ProductComparisonCard key={p.sku} product={p} />
           ))}
-          {!data?.products?.length && (
+          {!products.length && (
             <div className="text-center py-16 text-naar-warm border border-dashed border-naar-pebble rounded-naar bg-white/50">
-              No comparison data — run a scan first
+              {allProducts.length ? "No results match your filters." : "No comparison data — run a scan first."}
             </div>
           )}
         </div>

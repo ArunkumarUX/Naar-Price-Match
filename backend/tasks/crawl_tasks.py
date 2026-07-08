@@ -6,6 +6,7 @@ from engine.exception_detector import should_notify_immediately
 from engine.price_comparator import PriceComparator
 from engine.rule_engine import get_active_rule
 from matcher.embedding_matcher import ProductMatcher
+from models.database import Product
 from notifications.email_sender import send_alert_email
 from notifications.slack_notifier import send_slack_alert
 from scraper.amazon_scraper import AmazonScraper
@@ -13,7 +14,8 @@ from scraper.flipkart_scraper import FlipkartScraper
 from scraper.meesho_scraper import MeeshoScraper
 from scraper.naar_scraper import NaarScraper
 from scraper.seller_scraper import SellerScraper
-from services.db import persist_scan_results
+from services.db import SessionLocal, persist_scan_results
+from sqlalchemy import select
 from tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -55,9 +57,35 @@ async def _full_check():
         all_products.append(product)
 
     if not all_products:
+        # Fall back to products already stored in DB (e.g. seed / import-catalog)
+        try:
+            async with SessionLocal() as session:
+                result = await session.execute(
+                    select(Product).where(Product.is_active.is_(True)).limit(500)
+                )
+                db_products = result.scalars().all()
+                all_products = [
+                    {
+                        "sku": p.sku,
+                        "name": p.name,
+                        "variant": p.variant or "default",
+                        "price": float(p.base_price),
+                        "url": p.url or "https://naar.io/shop",
+                        "category": p.category,
+                        "source": "database",
+                    }
+                    for p in db_products
+                ]
+                if all_products:
+                    logger.info("Using %s products from database (live catalog unavailable)", len(all_products))
+        except Exception as exc:
+            logger.warning("DB product fallback failed: %s", exc)
+
+    if not all_products:
         catalog_error = (
             "Naar catalog empty — naar.io/shop could not be scraped. "
-            "Try POST /reports/sync-catalog or set NAAR_CATALOG_API / SCRAPERAPI_KEY in backend/.env"
+            "Try POST /reports/sync-catalog, POST /products/import-catalog, "
+            "or set NAAR_CATALOG_API / SCRAPERAPI_KEY in backend/.env"
         )
         logger.error(catalog_error)
         return {"alerts": 0, "products": 0, "catalog_error": catalog_error}

@@ -90,12 +90,13 @@ export interface Seller {
   active: boolean;
 }
 
-export const useAlerts = (params?: { severity?: Severity; limit?: number }) =>
+export const useAlerts = (params?: { severity?: Severity; resolved?: boolean; limit?: number }) =>
   useQuery<Alert[]>({
     queryKey: ["alerts", params],
     queryFn: async () => {
       const qs = new URLSearchParams();
       if (params?.severity) qs.set("severity", params.severity);
+      if (typeof params?.resolved === "boolean") qs.set("resolved", params.resolved ? "true" : "false");
       if (params?.limit) qs.set("limit", String(params.limit));
       const res = await fetch(`${BASE}/alerts/?${qs}`);
       if (!res.ok) throw new Error("Failed to fetch alerts");
@@ -184,11 +185,11 @@ export const useSyncCatalog = () => {
   });
 };
 
-export const useComparisonMatrix = () =>
+export const useComparisonMatrix = (limit = 200) =>
   useQuery<{ products: ComparisonProduct[]; seller_registry_count: number }>({
-    queryKey: ["comparison"],
+    queryKey: ["comparison", limit],
     queryFn: async () => {
-      const res = await fetch(`${BASE}/comparison/matrix`, { cache: "no-store" });
+      const res = await fetch(`${BASE}/comparison/matrix?limit=${limit}`, { cache: "no-store" });
       if (!res.ok) {
         const body = await res.text().catch(() => "");
         throw new Error(body || `API error ${res.status}`);

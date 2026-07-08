@@ -13,6 +13,40 @@ class CatalogImport(BaseModel):
     products: list[dict]
 
 
+def _as_float(value) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _extract_price(item: dict) -> float | None:
+    # Supported formats:
+    # - {"price": 123}
+    # - {"base_price": 123}
+    # - Naar payload: {"variants": [{"price": 123}, ...]}
+    direct = _as_float(item.get("price", item.get("base_price")))
+    if direct and direct > 0:
+        return direct
+
+    variants = item.get("variants") or []
+    if isinstance(variants, list):
+        for variant in variants:
+            if not isinstance(variant, dict):
+                continue
+            p = _as_float(variant.get("price"))
+            if p and p > 0:
+                return p
+    return None
+
+
 @router.post("/import-catalog")
 async def import_catalog(body: CatalogImport, db: AsyncSession = Depends(get_db)):
     """Import Naar shop catalog (e.g. from NAAR_CATALOG_API or manual export)."""
@@ -20,26 +54,35 @@ async def import_catalog(body: CatalogImport, db: AsyncSession = Depends(get_db)
 
     imported = 0
     for item in body.products:
-        name = str(item.get("name", "")).strip()
+        # Accept both normalized payload and raw Naar payload.
+        name = str(item.get("name") or item.get("title") or "").strip()
         if not name:
             continue
-        try:
-            price = float(str(item.get("price", item.get("base_price", 0))).replace(",", ""))
-        except (TypeError, ValueError):
+        price = _extract_price(item)
+        if not price or price <= 0:
             continue
-        if price <= 0:
+
+        status = str(item.get("status", "active")).lower()
+        if status and status != "active":
             continue
-        sku = str(item.get("sku") or name[:40]).strip()
+
+        sku = str(item.get("sku") or item.get("_id") or name[:40]).strip()
         url = str(item.get("url") or "https://naar.io/shop").strip()
         await upsert_product(
             db,
             {
                 "sku": sku,
                 "name": name,
-                "variant": item.get("variant") or "default",
+                "variant": item.get("variant")
+                or (item.get("variants", [{}])[0].get("variantName") if item.get("variants") else None)
+                or "default",
                 "price": price,
                 "url": url,
-                "category": item.get("category"),
+                "category": (
+                    item.get("category")
+                    if isinstance(item.get("category"), str)
+                    else (item.get("category") or {}).get("title")
+                ),
             },
         )
         imported += 1

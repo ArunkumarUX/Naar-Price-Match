@@ -16,15 +16,18 @@ const NAV = [
 
 function NavLink({ href, label }: { href: string; label: string }) {
   const pathname = usePathname();
-  const active = pathname === href;
+  const active = href === "/" ? pathname === "/" : pathname.startsWith(href);
   return (
     <Link
       href={href}
-      className={`text-sm font-semibold transition-colors ${
+      className={`relative text-sm font-semibold transition-colors pb-1 ${
         active ? "text-forest" : "text-naar-slate hover:text-forest"
       }`}
     >
       {label}
+      {active && (
+        <span className="absolute left-0 right-0 -bottom-0.5 h-0.5 rounded-full bg-turquoise" />
+      )}
     </Link>
   );
 }
