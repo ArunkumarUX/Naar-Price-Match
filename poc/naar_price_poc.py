@@ -356,6 +356,8 @@ _BLOCK_MARKERS = (
     "to discuss automated access to amazon data",
     "type the characters you see in this image",
     "our systems have detected unusual traffic",
+    "you don't have permission to access",      # Akamai "Access Denied" (Meesho)
+    "errors.edgesuite.net",
 )
 
 
@@ -364,17 +366,118 @@ def _looks_blocked(body: str) -> bool:
     return any(mk in low for mk in _BLOCK_MARKERS)
 
 
+def _merge_url_params(url: str, params: dict) -> str:
+    """Fold query params into the URL (marketplaces are GET-only here)."""
+    if not params:
+        return url
+    from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
+    parts = urlsplit(url)
+    q = dict(parse_qsl(parts.query, keep_blank_values=True))
+    q.update({k: str(v) for k, v in params.items()})
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(q), parts.fragment))
+
+
+class _Resp:
+    """Minimal response shim so a Selenium-rendered page flows through the same
+    block checks and parsers as a requests.Response (only .text/.status_code used)."""
+    __slots__ = ("text", "status_code")
+
+    def __init__(self, text: str, status_code: int = 200):
+        self.text = text
+        self.status_code = status_code
+
+
+# --- Selenium fetch backend (no per-request cost; renders JS; evades basic bot
+#     checks). Opt in with USE_SELENIUM=1. A single shared headless Chrome is
+#     reused across the run and closed at exit. -----------------------------
+_selenium_driver = None
+
+
+def _selenium_enabled() -> bool:
+    return os.environ.get("USE_SELENIUM", "").strip().lower() in ("1", "true", "yes")
+
+
+def _get_selenium_driver():
+    """Lazily build one shared Chrome. Prefers undetected-chromedriver (hides
+    navigator.webdriver / automation fingerprints) when available; falls back to
+    stock Selenium with the automation flags stripped. SELENIUM_HEADFUL=1 shows
+    the window (often bypasses more bot walls); SELENIUM_UC=0 forces stock."""
+    global _selenium_driver
+    if _selenium_driver is not None:
+        return _selenium_driver
+    headful = os.environ.get("SELENIUM_HEADFUL", "").strip() in ("1", "true", "yes")
+    use_uc = os.environ.get("SELENIUM_UC", "1").strip() not in ("0", "false", "no")
+    try:
+        if use_uc:
+            import undetected_chromedriver as uc
+            opts = uc.ChromeOptions()
+            opts.add_argument("--no-sandbox")
+            opts.add_argument("--disable-dev-shm-usage")
+            opts.add_argument("--lang=en-IN")
+            opts.add_argument(f"--user-agent={UA}")
+            _selenium_driver = uc.Chrome(options=opts, headless=not headful)
+        else:
+            from selenium import webdriver
+            from selenium.webdriver.chrome.options import Options
+            opts = Options()
+            if not headful:
+                opts.add_argument("--headless=new")
+            for a in ("--no-sandbox", "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled",
+                      "--lang=en-IN", "--window-size=1366,900", f"--user-agent={UA}"):
+                opts.add_argument(a)
+            opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+            opts.add_experimental_option("useAutomationExtension", False)
+            _selenium_driver = webdriver.Chrome(options=opts)
+            _selenium_driver.execute_cdp_cmd(
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"})
+    except Exception as e:
+        raise SourceError(f"selenium unavailable: {e}") from e
+    return _selenium_driver
+
+
+def _selenium_get(url: str, wait_ms: Optional[int], timeout: int) -> str:
+    driver = _get_selenium_driver()
+    try:
+        driver.set_page_load_timeout(max(timeout, 30))
+        driver.get(url)
+    except Exception as e:
+        raise SourceError(f"selenium fetch failed: {_redact_secrets(str(e))}") from e
+    # Let JS settle (SERP XHR, __NEXT_DATA__ hydration).
+    ms = wait_ms if wait_ms is not None else int(_cfg_float("SELENIUM_WAIT_MS", 4000))
+    time.sleep(ms / 1000.0)
+    return driver.page_source
+
+
+def _close_selenium() -> None:
+    global _selenium_driver
+    if _selenium_driver is not None:
+        try:
+            _selenium_driver.quit()
+        except Exception:
+            pass
+        _selenium_driver = None
+
+
+import atexit as _atexit
+_atexit.register(_close_selenium)
+
+
 def _http_get(url: str, **kw) -> "requests.Response":
-    """GET a marketplace URL.
+    """GET a marketplace URL through the selected fetch backend.
 
-    ScraperAPI is used when SCRAPERAPI_KEY is set AND either:
-      - the host is meesho.com (blocked on direct fetch), or
-      - SCRAPERAPI_ALL=1 (force every request through the proxy).
+    Backend precedence:
+      1. Selenium (USE_SELENIUM=1) — a real headless Chrome that renders JS and
+         evades basic bot checks; no per-request cost. See _get_selenium_driver.
+      2. ScraperAPI (SCRAPERAPI_KEY set) for meesho.com, or every host with
+         SCRAPERAPI_ALL=1.
+      3. Plain requests (default).
 
-    JS render defaults off (fast). Set SCRAPERAPI_RENDER=1 for Meesho/JS-heavy
-    pages. Callers may pass render=True/False to override per request.
+    JS render/wait apply to the proxy/Selenium paths. Callers may pass
+    render=True/False, wait_ms, params, timeout, headers.
     """
-    if requests is None:
+    if requests is None and not _selenium_enabled():
         raise SourceError("requests not installed")
     params = dict(kw.pop("params", None) or {})
     timeout = kw.pop("timeout", 25)
@@ -390,14 +493,14 @@ def _http_get(url: str, **kw) -> "requests.Response":
         or host.endswith("meesho.com")
     )
     try:
-        if use_proxy:
-            if params:
-                from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
-                parts = urlsplit(url)
-                q = dict(parse_qsl(parts.query, keep_blank_values=True))
-                q.update({k: str(v) for k, v in params.items()})
-                url = urlunsplit((parts.scheme, parts.netloc, parts.path,
-                                  urlencode(q), parts.fragment))
+        if _selenium_enabled():
+            full = _merge_url_params(url, params)
+            w = wait_ms
+            if w is None and host.endswith("meesho.com"):
+                w = 6000            # give Meesho's client-side search XHR time
+            r = _Resp(_selenium_get(full, wait_ms=w, timeout=timeout))
+        elif use_proxy:
+            url = _merge_url_params(url, params)
             if render_override is None:
                 render = os.environ.get("SCRAPERAPI_RENDER", "").strip() in (
                     "1", "true", "yes")
@@ -425,6 +528,8 @@ def _http_get(url: str, **kw) -> "requests.Response":
         else:
             r = requests.get(url, headers=headers, params=params or None,
                              timeout=timeout, **kw)
+    except SourceError:
+        raise                                  # selenium/backend errors keep their message
     except Exception as e:  # DNS, timeout, refused — all honest failures
         raise SourceError(f"fetch failed: {_redact_secrets(str(e))}") from e
     if r.status_code in (403, 429, 503):

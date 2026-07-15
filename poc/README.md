@@ -94,9 +94,38 @@ python poc/prove_llm.py                               # mock-server judge proof
 python poc/naar_price_poc.py --backend direct --limit 10   # live run (needs SCRAPERAPI_KEY / access)
 ```
 
-Direct-fetch marketplaces need network access; Amazon/Flipkart/Meesho commonly
-soft-block, and Meesho needs `SCRAPERAPI_KEY`. Blocks surface as `SOURCE_ERROR`,
-never a silent `PRODUCT_NOT_FOUND`.
+Direct-fetch marketplaces need network access and commonly bot-block. Blocks
+surface as `SOURCE_ERROR`, never a silent `PRODUCT_NOT_FOUND`.
+
+### Fetch backends
+
+`_http_get` picks a backend in this order:
+
+1. **Selenium** — `USE_SELENIUM=1`. A real headless Chrome (undetected-chromedriver
+   when available) that renders JS and evades basic bot checks. **No per-request
+   cost** — the free alternative to ScraperAPI.
+   ```bash
+   USE_SELENIUM=1 python poc/naar_price_poc.py --backend direct --limit 10
+   ```
+   Knobs: `SELENIUM_HEADFUL=1` (show the window; bypasses more walls),
+   `SELENIUM_WAIT_MS=4000` (JS settle time), `SELENIUM_UC=0` (force stock Selenium).
+2. **ScraperAPI** — `SCRAPERAPI_KEY` set (used for meesho.com, or all hosts with
+   `SCRAPERAPI_ALL=1`).
+3. **Plain requests** — default; fine only for non-bot-walled pages.
+
+**Measured (live, headless Selenium, no ScraperAPI):**
+
+| Marketplace | Result |
+|-------------|--------|
+| Amazon.in | ✅ full search page, ~60 product cards |
+| Flipkart | ✅ full search page, `/p/` links + JSON-LD |
+| Meesho | ⛔ Akamai **Access Denied** — needs a residential proxy or ScraperAPI |
+
+So Selenium replaces ScraperAPI for **Amazon + Flipkart** at zero cost; **Meesho**
+sits behind Akamai and still needs a proxy/ScraperAPI. Note that fetching is only
+half the job — a low *match* rate is the product/seller gate being deliberately
+strict (correctness over coverage), not a fetch problem, so expect high precision
+and lower recall regardless of backend.
 
 ## Borderline LLM judge (optional)
 
