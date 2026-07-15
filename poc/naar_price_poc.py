@@ -127,7 +127,9 @@ class Record:
     naar_selling_price: float
     search_query: Optional[str] = None     # reproducibility evidence (fix 9)
     currency: str = "INR"
-    marketplace_selling_price: Optional[float] = None
+    marketplace_selling_price: Optional[float] = None      # raw listing price
+    marketplace_unit_price: Optional[float] = None         # normalised to one Naar unit
+    qty_ratio: Optional[float] = None                      # marketplace units per Naar unit
     marketplace_sold_by: Optional[str] = None
     marketplace_seller_legal_name: Optional[str] = None
     marketplace_seller_gstin: Optional[str] = None
@@ -150,6 +152,8 @@ class Record:
         # Invariant from the brief: a price exists only on MATCHED rows.
         if self.status != "MATCHED":
             self.marketplace_selling_price = None
+            self.marketplace_unit_price = None
+            self.qty_ratio = None
 
 
 # --------------------------------------------------------------------------
@@ -293,6 +297,30 @@ def extract_attrs(text: str) -> dict:
     if m:
         attrs["pack"] = int(m.group(1) or m.group(2))
     return attrs
+
+
+def quantity_ratio(n_attrs: dict, c_attrs: dict) -> Optional[float]:
+    """How many Naar units the marketplace listing contains, when comparable —
+    so a single-unit-vs-multipack (or 100g-vs-250g) is compared PER UNIT instead
+    of mislabelled a mismatch. Returns marketplace_units / naar_units, or None
+    when the two aren't quantity-comparable (one side states a size the other
+    doesn't). A missing pack count is treated as 1 only when the other side
+    states a pack."""
+    nq, cq = n_attrs.get("qty_base"), c_attrs.get("qty_base")
+    np_, cp = n_attrs.get("pack"), c_attrs.get("pack")
+    if nq and cq:                       # both weights/volumes known
+        return cq / nq
+    if np_ or cp:                       # a pack count on either side (missing => 1 each)
+        return (cp or 1) / (np_ or 1)
+    return None                         # no comparable quantity signal
+
+
+def per_unit_price(price: Optional[float], ratio: Optional[float]) -> Optional[float]:
+    """Marketplace price expressed per Naar unit: price / ratio. ratio None or 1
+    leaves the price unchanged (nothing to normalise)."""
+    if price is None or not ratio or ratio <= 0:
+        return price
+    return round(price / ratio, 2)
 
 
 # --------------------------------------------------------------------------
@@ -1193,28 +1221,25 @@ def product_gate(naar_product: dict, variant: dict, cand: Candidate,
     c_attrs = extract_attrs(cand.title)
     evidence = []
 
-    # Quantity / pack must agree — symmetrically. A unit-vs-multipack mismatch is
-    # the price-integrity trap that a large MATCHED delta hides (Naar single ₹56 vs
-    # an Amazon "pack of N" at ₹259), so a quantity/pack stated on EITHER side that
-    # the other lacks or contradicts blocks an auto-pass.
+    # Quantity / pack: a single-unit-vs-multipack (or 100g-vs-250g) is the SAME
+    # product in a different size — not a mismatch. When the two are quantity-
+    # comparable we record the ratio and normalise the PRICE per unit downstream,
+    # so the match stands and the delta is apples-to-apples. We only bail when the
+    # sizes can't be compared fairly (stated on one side only) or the ratio is
+    # implausible (probably a different product).
     n_qty, c_qty = n_attrs.get("qty_base"), c_attrs.get("qty_base")
-    if n_qty is not None:
-        if c_qty is None:
-            return "borderline", "naar states quantity; listing title omits it"
-        if abs(n_qty - c_qty) > 1e-6:
-            return "fail", f"quantity mismatch {n_attrs['qty_raw']} vs {c_attrs.get('qty_raw')}"
-        evidence.append(f"quantity={n_attrs['qty_raw']}")
-    elif c_qty is not None:
-        # The listing declares a size Naar doesn't — likely a different pack/weight.
-        return "borderline", f"listing states quantity {c_attrs.get('qty_raw')!r} that naar does not"
-
     n_pack, c_pack = n_attrs.get("pack"), c_attrs.get("pack")
-    if n_pack is not None and c_pack is not None and n_pack != c_pack:
-        return "fail", f"pack-count mismatch {n_pack} vs {c_pack}"
-    if (n_pack or 1) == 1 and c_pack and c_pack > 1:
-        return "borderline", f"listing is a pack of {c_pack}; naar is a single unit"
-    if n_pack:
-        evidence.append(f"pack={n_pack}")
+    ratio = quantity_ratio(n_attrs, c_attrs)
+    weight_one_sided = (n_qty is not None) != (c_qty is not None) and not (n_pack or c_pack)
+    if weight_one_sided:
+        return "borderline", "quantity stated on only one side; cannot compare per unit"
+    if ratio is not None:
+        if ratio > 30 or ratio < 1 / 30:
+            return "borderline", f"implausible quantity ratio {ratio:.2g} — likely a different product"
+        if abs(ratio - 1.0) > 1e-6:
+            evidence.append(f"qty_ratio={ratio:.3g} (per-unit compare)")
+        else:
+            evidence.append("quantity=match")
 
     # Stated variant attributes (colour, size — incl. numeric sizes like "8",
     # "42") must appear as whole words/numbers in the title (fix 2, v3-5).
@@ -1501,12 +1526,26 @@ def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
             else:
                 saw_other = True
 
+    # Per-unit normalisation: compare listings on price-per-Naar-unit so a
+    # multipack/larger size is apples-to-apples with Naar's single unit.
+    _desc = product.get("description") or ""
+    _n_attrs = extract_attrs(variant_search_text(product, variant) + " " + _desc)
+    def _ratio(c: Candidate) -> Optional[float]:
+        return quantity_ratio(_n_attrs, extract_attrs(c.title))
+    def _unit_of(t) -> float:
+        up = per_unit_price(t[1].price_inr, _ratio(t[0]))
+        return up if up is not None else t[1].price_inr
+
     if matched_offers:
         purchasable = [t for t in matched_offers if t[1].in_stock and t[1].price_inr is not None]
         if purchasable:
-            cand, offer, conf, signal, pevidence = min(purchasable, key=lambda t: t[1].price_inr)
+            cand, offer, conf, signal, pevidence = min(purchasable, key=_unit_of)
+            ratio = _ratio(cand)
+            unit = per_unit_price(offer.price_inr, ratio)
             return Record(**base, status="MATCHED",
                           marketplace_selling_price=offer.price_inr,
+                          marketplace_unit_price=unit,
+                          qty_ratio=ratio,
                           marketplace_sold_by=offer.seller_display,
                           marketplace_seller_legal_name=offer.seller_legal,
                           marketplace_seller_gstin=offer.seller_gstin,
@@ -1591,8 +1630,13 @@ def run(args) -> list[Record]:
                 records.append(rec)
                 delta = ""
                 if rec.status == "MATCHED":
-                    d = rec.marketplace_selling_price - rec.naar_selling_price
-                    delta = f"  naar ₹{rec.naar_selling_price:.2f} vs ₹{rec.marketplace_selling_price:.2f} (Δ {d:+.2f})"
+                    cmp_price = rec.marketplace_unit_price or rec.marketplace_selling_price
+                    d = cmp_price - rec.naar_selling_price
+                    norm = ""
+                    if rec.qty_ratio and abs(rec.qty_ratio - 1.0) > 1e-6:
+                        norm = f" [₹{rec.marketplace_selling_price:.2f}/{rec.qty_ratio:.3g}u]"
+                    delta = (f"  naar ₹{rec.naar_selling_price:.2f} vs ₹{cmp_price:.2f}/unit"
+                             f"{norm} (Δ {d:+.2f})")
                 print(f"[{rec.status:<17}] {product.get('title','')[:34]:<34} "
                       f"({variant.get('variantName') or '-'}) @ {m}{delta}")
     return records
@@ -1755,21 +1799,36 @@ def self_test() -> int:
     check("numeric size 8 not falsely matched inside '18'",
           not re.search(r"\b8\b", "Running Shoe Size 18") and verdict != "fail")
 
-    # 11b. Pack/quantity symmetry — the false-MATCHED trap from the live run.
+    # 11b. Per-unit normalisation — a multipack is the SAME product, compared per unit.
     snack = {"title": "Theni Tomato Murukku", "description": "", "seller": {}}
     snack_v = {"attributes": {}, "variantName": None, "sellingPrice": 56.0}
-    verdict, _ = product_gate(snack, snack_v,
-                              Candidate("x", "P", "u", "Theni Tomato Murukku Pack of 5"), False)
-    check("naar single vs listing 'Pack of 5' -> borderline (not auto-pass)",
-          verdict == "borderline")
+    verdict, ev = product_gate(snack, snack_v,
+                               Candidate("x", "P", "u", "Theni Tomato Murukku Pack of 5"), False)
+    check("naar single vs listing 'Pack of 5' -> pass with qty_ratio (per-unit)",
+          verdict == "pass" and "qty_ratio=5" in ev)
     verdict, _ = product_gate(snack, snack_v,
                               Candidate("x", "W", "u", "Theni Tomato Murukku 500 g"), False)
-    check("naar states no quantity but listing states 500g -> borderline",
+    check("quantity stated on only one side -> borderline (can't compare per-unit)",
           verdict == "borderline")
     verdict, _ = product_gate(snack, snack_v,
                               Candidate("x", "E", "u", "Theni Tomato Murukku"), False)
     check("naar single vs plain listing (no qty either side) still passes",
           verdict == "pass")
+    # per-unit price: a pack of 5 at ₹259 is ₹51.8/unit — cheaper than Naar ₹56.
+    check("per_unit_price normalises a multipack", per_unit_price(259.0, 5.0) == 51.8)
+
+    class PackStub(MarketplaceAdapter):
+        name = "amazon_in"
+        def search(self, q):
+            return [Candidate("amazon_in", "PK", "u", "Theni Tomato Murukku Pack of 5",
+                              [Offer("Theni Snacks", None, 259.0, offer_ref="PK:o")])]
+    snack2 = {"_id": "n", "title": "Theni Tomato Murukku", "description": "",
+              "seller": {"storeName": "Theni Snacks"}}
+    snack2_v = {"_id": "v", "attributes": {}, "variantName": None, "sellingPrice": 56.0}
+    rec = compare_variant(snack2, snack2_v, PackStub(), False)
+    check("multipack MATCHED with per-unit price (₹259/5=₹51.8), not raw ₹259",
+          rec.status == "MATCHED" and rec.marketplace_unit_price == 51.8
+          and rec.qty_ratio == 5.0 and rec.marketplace_selling_price == 259.0)
 
     # 12. Borderline judge is provider-agnostic and honest when unconfigured.
     check("judge parses a structured same_product verdict",

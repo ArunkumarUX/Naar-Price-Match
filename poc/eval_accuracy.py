@@ -80,15 +80,15 @@ add("p1", p, v, C("Amla Powder Hair Mask 100g",
     "AMBIGUOUS_MATCH", False, "derivative product, same seller -> not a product match")
 add("p2", p, v, C("Bhringraj Powder 100g",
                   [Offer("TREASURE FLAVOURS", None, 210.0)]),
-    "PRODUCT_NOT_FOUND", False, "different product entirely")
+    "AMBIGUOUS_MATCH", False, "different herb, shares 'powder' — gate abstains, judge rejects")
 add("p3", p, v, C("Amla Juice 1L",
                   [Offer("TREASURE FLAVOURS", None, 300.0)]),
-    "PRODUCT_NOT_FOUND", False, "different form + quantity")
+    "AMBIGUOUS_MATCH", False, "different form (juice vs powder), shares 'amla' — gate abstains, judge rejects")
 
 # --- QUANTITY / VARIANT MISMATCH -> product fail ---
 add("q1", p, v, C("Pure Amla Powder 250g",
                   [Offer("TREASURE FLAVOURS", None, 300.0)]),
-    "PRODUCT_NOT_FOUND", False, "quantity mismatch 100g vs 250g")
+    "MATCHED", True, "100g vs 250g: same product, compared per-unit (₹300/2.5=₹120)")
 
 ps, vs = prod("Kanchipuram Silk Cotton Saree", "Handloom saree 6.2m.",
               "Kaithari Kalanjiyam", "NITHYA VINOTH KUMAR", "Teal", {"colour": "Teal"}, price=1499.0)
