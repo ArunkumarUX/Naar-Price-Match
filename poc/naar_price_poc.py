@@ -1566,8 +1566,11 @@ def main():
     ap.add_argument("--backend", choices=["fixture", "direct"], default="fixture")
     ap.add_argument("--limit", type=int, default=10)
     ap.add_argument("--skip", type=int, default=0)
+    # Default to the two marketplaces Selenium fetches for free. Meesho is behind
+    # Akamai (Access Denied to headless) and needs a managed provider / proxy, so
+    # it's opt-in: add `--marketplaces amazon_in flipkart meesho` with SCRAPERAPI_KEY.
     ap.add_argument("--marketplaces", nargs="+",
-                    default=["amazon_in", "flipkart", "meesho"],
+                    default=["amazon_in", "flipkart"],
                     choices=["amazon_in", "flipkart", "meesho"])
     ap.add_argument("--llm-judge", action="store_true",
                     help="use an LLM for borderline product pairs (ANTHROPIC_API_KEY)")

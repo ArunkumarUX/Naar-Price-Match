@@ -97,6 +97,11 @@ python poc/naar_price_poc.py --backend direct --limit 10   # live run (needs SCR
 Direct-fetch marketplaces need network access and commonly bot-block. Blocks
 surface as `SOURCE_ERROR`, never a silent `PRODUCT_NOT_FOUND`.
 
+**Default marketplaces: `amazon_in` + `flipkart`** — the two Selenium fetches for
+free. Meesho sits behind Akamai (Access Denied to headless) and needs a managed
+provider / proxy, so it's **opt-in**:
+`--marketplaces amazon_in flipkart meesho` with `SCRAPERAPI_KEY` set.
+
 ### Fetch backends
 
 `_http_get` picks a backend in this order:
