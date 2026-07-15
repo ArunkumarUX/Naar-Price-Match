@@ -771,6 +771,19 @@ def _seller_profile_lookup_enabled() -> bool:
     return os.environ.get("SELLER_PROFILE_LOOKUP", "").strip().lower() in ("1", "true", "yes")
 
 
+def _amazon_profile_url(soup_or_el) -> Optional[str]:
+    """Find the seller id (`seller=<ID>`) and build the seller-INFO page URL —
+    `.../gp/help/seller/at-a-glance.html?seller=<ID>`, which carries Business
+    Name + GST. (The `/sp?seller=` storefront does NOT, and often 404s.) Ignores
+    generic links with no seller id."""
+    for a in soup_or_el.select("a[href*='seller=']"):
+        m = re.search(r"[?&]seller=([A-Z0-9]{6,})", a.get("href", ""), re.I)
+        if m:
+            return ("https://www.amazon.in/gp/help/seller/at-a-glance.html"
+                    f"?seller={m.group(1)}")
+    return None
+
+
 class AmazonInAdapter(MarketplaceAdapter):
     """Direct fallback for amazon.in. Search page -> product pages (JSON-LD)
     -> AOD endpoint for the full offer list. Blocks surface honestly: a failed
@@ -801,16 +814,14 @@ class AmazonInAdapter(MarketplaceAdapter):
 
     def _offers(self, asin: str) -> list[Offer]:
         from bs4 import BeautifulSoup
-        from urllib.parse import urljoin
         offers: list[Offer] = []
         pr = _http_get(f"https://www.amazon.in/dp/{asin}")
         soup = BeautifulSoup(pr.text, "html.parser")
 
         # The buy-box "Sold by" seller-profile link — the anchor for GSTIN/legal
         # lookup that confirms a seller trading under a different display name.
-        dp_seller_a = soup.select_one("#sellerProfileTriggerId, #merchant-info a, a[href*='seller=']")
-        dp_seller_url = urljoin("https://www.amazon.in", dp_seller_a.get("href")) \
-            if (dp_seller_a and dp_seller_a.get("href")) else None
+        # Must be a real /sp?seller=<ID> link, not a generic help page.
+        dp_seller_url = _amazon_profile_url(soup)
 
         # Buy box via product page JSON-LD when present.
         for o in _jsonld_offers(pr.text):
@@ -845,12 +856,11 @@ class AmazonInAdapter(MarketplaceAdapter):
             asoup = BeautifulSoup(ar.text, "html.parser")
             for i, block in enumerate(asoup.select("#aod-offer")):
                 sold_by = block.select_one("#aod-offer-soldBy a, #aod-offer-soldBy .a-color-base")
-                sold_a = block.select_one("#aod-offer-soldBy a[href]")
                 price_el = block.select_one(".a-price .a-offscreen")
                 offers.append(Offer(
                     seller_display=sold_by.get_text(strip=True) if sold_by else None,
                     price_inr=_parse_inr(price_el.get_text()) if price_el else None,
-                    seller_url=urljoin("https://www.amazon.in", sold_a.get("href")) if sold_a else None,
+                    seller_url=_amazon_profile_url(block),
                     offer_ref=f"{asin}:aod{i}"))
         except SourceError:
             if not offers:

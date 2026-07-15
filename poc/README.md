@@ -122,13 +122,19 @@ store URL don't change. The gate resolves identity in tiers, hardest signal firs
 Only tiers 1–3 (hard identifiers) become a `MATCH`; soft name similarity stays
 `AMBIGUOUS` for review — so **recall on renamed sellers goes up without faking a
 match**. Two inputs feed this:
-- **Onboarding map** — `poc/seller_identity.json` (see `seller_identity.example.json`,
-  gitignored): per-seller `gstin` / `businessName` / `brand` / `pincode` /
-  `<marketplace>_url`, collected once from the seller. Turns inference into a lookup.
-- **Seller-profile lookup** — `SELLER_PROFILE_LOOKUP=1` makes the Amazon adapter fetch
-  each seller's profile page and read the **legal name + GSTIN** from it, so a seller
-  listed under a different store name is still confirmed by hard id (best-effort;
-  a miss just leaves the row `AMBIGUOUS`).
+
+- **Onboarding map — the reliable source.** `poc/seller_identity.json` (see
+  `seller_identity.example.json`, gitignored): per-seller `gstin` / `businessName` /
+  `brand` / `pincode` / `<marketplace>_url`. **Naar already holds this** in its seller
+  onboarding / KYC records (every seller provided GSTIN + legal entity to sell on
+  Naar), so this is a database export, not a manual lookup. Merged via
+  `resolve_naar_seller()`.
+- **Marketplace seller-profile scrape — best-effort only.** `SELLER_PROFILE_LOOKUP=1`
+  makes the Amazon adapter capture the seller-profile link and try to read the legal
+  name + GSTIN. In practice **Amazon gates the seller-info page** (it 404s on direct
+  access and hides GST behind interaction), so treat this as opportunistic — a miss
+  just leaves the row `AMBIGUOUS`. **Don't rely on it; drive matching from the
+  onboarding map above.**
 
 **5 · Decision → status.** Verdicts are collected across **all** matched
 candidates/offers, then one status is chosen (see legend below). The cheapest
