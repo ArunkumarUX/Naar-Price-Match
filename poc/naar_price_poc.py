@@ -115,6 +115,7 @@ class Candidate:
     title: str
     offers: list[Offer] = field(default_factory=list)
     offers_error: Optional[str] = None     # set when offer enumeration failed (fix 6)
+    gtin: Optional[str] = None             # barcode (GTIN/EAN/UPC) from the listing, if exposed
 
 
 @dataclass
@@ -247,34 +248,51 @@ _seller_identity_cache: Optional[dict] = None
 
 
 def load_seller_identities() -> dict:
-    """Optional onboarding map: poc/seller_identity.json keyed by Naar sellerId ->
-    {gstin, businessName, brand, pincode, amazon_url, flipkart_url, meesho_url}.
-    This is the 'ask the seller once' input that turns inference into a lookup."""
+    """Naar seller KYC map, keyed by Naar sellerId ->
+    {gstin, businessName, brand, pincode, amazon_url, flipkart_url, meesho_url,
+     not_on:[...]}. Naar already holds gstin + legal entity from seller KYC, so
+    this is a DB export, not a manual lookup. Path: $NAAR_KYC_FILE, else
+    poc/seller_identity.json."""
     global _seller_identity_cache
     if _seller_identity_cache is not None:
         return _seller_identity_cache
     import pathlib
-    p = pathlib.Path(__file__).resolve().parent / "seller_identity.json"
+    env_path = os.environ.get("NAAR_KYC_FILE", "").strip()
+    p = pathlib.Path(env_path) if env_path else \
+        pathlib.Path(__file__).resolve().parent / "seller_identity.json"
     try:
-        _seller_identity_cache = json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
+        _seller_identity_cache = {k: v for k, v in data.items() if not k.startswith("_")}
     except (OSError, json.JSONDecodeError):
         _seller_identity_cache = {}
     return _seller_identity_cache
 
 
 def resolve_naar_seller(product: dict, marketplace: str) -> dict:
-    """Merge the product's inline seller block with the onboarding map, and pick
-    the store URL registered for THIS marketplace. Onboarding values fill gaps;
-    inline Naar data wins where both exist."""
+    """Merge the product's inline seller block with the KYC map, and pick the
+    store URL registered for THIS marketplace. KYC values fill gaps; inline Naar
+    data wins where both exist."""
     seller = dict(product.get("seller") or {})
     ident = load_seller_identities().get(str(product.get("sellerId") or ""), {})
-    for k in ("gstin", "brand", "pincode", "businessName", "storeName"):
+    for k in ("gstin", "brand", "pincode", "businessName", "storeName", "not_on"):
         if not seller.get(k) and ident.get(k):
             seller[k] = ident[k]
     url = ident.get(f"{marketplace}_url") or ident.get("store_url")
     if url:
         seller["store_url"] = url
     return seller
+
+
+def seller_present_on(marketplace: str, seller: dict) -> Optional[bool]:
+    """Is this seller on the marketplace, per KYC? True (has a store URL there),
+    False (explicitly listed in `not_on`), or None (unknown -> search as usual).
+    A False lets the pipeline SKIP the seller's products entirely — no fetch."""
+    if seller.get("store_url"):
+        return True
+    not_on = seller.get("not_on")
+    if isinstance(not_on, list) and marketplace in not_on:
+        return False
+    return None
 
 
 def content_tokens(s: str) -> set[str]:
@@ -297,6 +315,25 @@ def extract_attrs(text: str) -> dict:
     if m:
         attrs["pack"] = int(m.group(1) or m.group(2))
     return attrs
+
+
+def _norm_gtin13(s: Optional[str]) -> str:
+    """A GTIN/EAN/UPC as bare digits (8–14). The single strongest product
+    identity signal: an exact GTIN match is the same product, full stop."""
+    if not s:
+        return ""
+    d = re.sub(r"\D", "", str(s))
+    return d if 8 <= len(d) <= 14 else ""
+
+
+def naar_gtin(product: dict, variant: dict) -> str:
+    """Naar-side barcode from the variant (or product) if the catalogue has one."""
+    for src in (variant.get("barcode"), variant.get("gtin"), variant.get("ean"),
+                product.get("barcode"), product.get("gtin")):
+        g = _norm_gtin13(src)
+        if g:
+            return g
+    return ""
 
 
 def quantity_ratio(n_attrs: dict, c_attrs: dict) -> Optional[float]:
@@ -683,6 +720,25 @@ def _jsonld_offers(html: str) -> list[dict]:
     return out
 
 
+def _jsonld_gtin(html: str) -> Optional[str]:
+    """Pull a product barcode from schema.org JSON-LD (gtin13/gtin/ean/etc.),
+    when the listing exposes one. Deterministic; best-effort (often absent)."""
+    for m in re.finditer(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>',
+                         html, re.S | re.I):
+        try:
+            data = json.loads(m.group(1))
+        except json.JSONDecodeError:
+            continue
+        for it in (data if isinstance(data, list) else [data]):
+            if not isinstance(it, dict):
+                continue
+            for key in ("gtin13", "gtin14", "gtin12", "gtin8", "gtin", "ean", "isbn"):
+                g = _norm_gtin13(it.get(key))
+                if g:
+                    return g
+    return None
+
+
 def _extract_embedded_json(html: str, marker: str) -> Optional[dict]:
     """Brace-matched extraction of `marker = {...}` (fix 7). Deterministic:
     respects strings/escapes, no regex-over-JSON guessing."""
@@ -834,17 +890,19 @@ class AmazonInAdapter(MarketplaceAdapter):
                                    title_el.get_text(" ", strip=True)))
         for c in cands:
             try:
-                c.offers = self._offers(c.listing_id)
+                c.offers = self._offers(c)
             except SourceError as e:
                 c.offers, c.offers_error = [], str(e)      # fix 6
             time.sleep(1.0)  # be polite; this is a 10-product POC, not a crawler
         return cands
 
-    def _offers(self, asin: str) -> list[Offer]:
+    def _offers(self, cand: Candidate) -> list[Offer]:
         from bs4 import BeautifulSoup
+        asin = cand.listing_id
         offers: list[Offer] = []
         pr = _http_get(f"https://www.amazon.in/dp/{asin}")
         soup = BeautifulSoup(pr.text, "html.parser")
+        cand.gtin = cand.gtin or _jsonld_gtin(pr.text)     # barcode for GTIN-anchored match
 
         # The buy-box "Sold by" seller-profile link — the anchor for GSTIN/legal
         # lookup that confirms a seller trading under a different display name.
@@ -1220,6 +1278,14 @@ def product_gate(naar_product: dict, variant: dict, cand: Candidate,
     n_attrs = extract_attrs(n_text + " " + desc)
     c_attrs = extract_attrs(cand.title)
     evidence = []
+
+    # Tier 0 — GTIN/barcode. If both sides expose one, an exact match IS the same
+    # product (deterministic, no fuzzy title needed); a mismatch is a hard fail.
+    n_gtin, c_gtin = naar_gtin(naar_product, variant), _norm_gtin13(cand.gtin)
+    if n_gtin and c_gtin:
+        if n_gtin == c_gtin:
+            return "pass", f"gtin_exact={n_gtin}"
+        return "fail", f"gtin mismatch {n_gtin} vs {c_gtin}"
 
     # Quantity / pack: a single-unit-vs-multipack (or 100g-vs-250g) is the SAME
     # product in a different size — not a mismatch. When the two are quantity-
@@ -1624,6 +1690,12 @@ def run(args) -> list[Record]:
                       file=sys.stderr)
                 continue
             for m, adapter in adapters.items():
+                # Seller-presence-first: if KYC says this seller isn't on this
+                # marketplace, skip — no wasted fetch (the elegant efficiency win).
+                if seller_present_on(m, resolve_naar_seller(product, m)) is False:
+                    print(f"[SKIPPED (not on {m})] {product.get('title','')[:30]:<30} "
+                          f"— seller not on {m} per KYC", file=sys.stderr)
+                    continue
                 if isinstance(adapter, FixtureAdapter):
                     adapter.bind(product.get("_id", ""))
                 rec = compare_variant(product, variant, adapter, args.llm_judge, args.strict)
@@ -1705,6 +1777,14 @@ def self_test() -> int:
               seller_url="https://www.amazon.in/sp?seller=A1B2C3D4E5&ref=x"))
     check("seller-provided store URL matches listing's seller link -> MATCH",
           v == "MATCH" and s == "store_url_match")
+
+    # 1c. Seller-presence-first (KYC): skip marketplaces a seller isn't on.
+    check("KYC store URL -> present on marketplace",
+          seller_present_on("amazon_in", {"store_url": "https://x/sp?seller=A1"}) is True)
+    check("KYC not_on -> known absent (skip, no fetch)",
+          seller_present_on("meesho", {"not_on": ["meesho"]}) is False)
+    check("no KYC signal -> unknown (search as usual)",
+          seller_present_on("flipkart", {"storeName": "X"}) is None)
 
     # 2. Word-boundary attributes
     verdict, _ = product_gate({"title": "Kanchipuram Silk Cotton Saree", "description": ""},
@@ -1829,6 +1909,26 @@ def self_test() -> int:
     check("multipack MATCHED with per-unit price (₹259/5=₹51.8), not raw ₹259",
           rec.status == "MATCHED" and rec.marketplace_unit_price == 51.8
           and rec.qty_ratio == 5.0 and rec.marketplace_selling_price == 259.0)
+
+    # 11c. GTIN/barcode anchoring — exact barcode is the same product, no fuzzy needed.
+    gp = {"_id": "g", "title": "Foo", "description": "", "seller": {"storeName": "S"}}
+    gv = {"_id": "gv", "attributes": {}, "barcode": "8901234567890", "sellingPrice": 100.0}
+    verdict, ev = product_gate(gp, gv,
+                               Candidate("x", "G", "u", "Completely Unrelated Title",
+                                         gtin="8901234567890"), False)
+    check("GTIN exact -> pass regardless of title", verdict == "pass" and "gtin_exact" in ev)
+    verdict, _ = product_gate(gp, gv,
+                              Candidate("x", "G2", "u", "Foo", gtin="0000000000000"), False)
+    check("GTIN mismatch -> fail", verdict == "fail")
+
+    class GtinStub(MarketplaceAdapter):
+        name = "amazon_in"
+        def search(self, q):
+            return [Candidate("amazon_in", "GC", "u", "Random Unrelated Title",
+                              [Offer("S", None, 88.0)], gtin="8901234567890")]
+    rec = compare_variant(gp, gv, GtinStub(), False)
+    check("GTIN-matched listing MATCHED even with an unrelated title",
+          rec.status == "MATCHED" and rec.marketplace_selling_price == 88.0)
 
     # 12. Borderline judge is provider-agnostic and honest when unconfigured.
     check("judge parses a structured same_product verdict",

@@ -83,6 +83,11 @@ flowchart TD
     G -->|match, price unextractable| K[SOURCE_ERROR]
 ```
 
+**0 · Seller-presence-first (`seller_present_on`).** Before searching, KYC tells us
+whether the seller is even on a marketplace: if `not_on` lists it → **skip, no
+fetch** (the efficiency win — don't crawl absent sellers); if a store URL is on
+file → the seller is already confirmed. Only when presence is unknown do we search.
+
 **1 · Input (`fetch_naar_products`, `iter_variants`).** Pull active products from
 the Naar products API, one row **per variant**. The Naar comparison price is the
 variant's `sellingPrice` (INR) — `price` / `priceWithoutTax` / MRP are kept as
@@ -96,10 +101,13 @@ Extraction is **structured only** — JSON-LD, Flipkart `__INITIAL_STATE__`, Mee
 `__NEXT_DATA__` — never a regex-first-price grab.
 
 **3 · Product gate (`product_gate`).** Per candidate → `pass` / `fail` / `borderline`:
-- **Quantity & pack** must agree **symmetrically** — a weight or "pack of N" stated
-  on either side that the other lacks or contradicts blocks an auto-pass (a single
-  unit vs a multipack → `borderline`/`fail`, so a large price delta can't hide a
-  pack mismatch).
+- **GTIN / barcode (tier 0)** — if both sides expose a barcode, an exact match is
+  the same product (deterministic, no fuzzy title); a mismatch is a hard `fail`.
+- **Per-unit normalization** — a single-unit-vs-multipack (or 100g vs 250g) is the
+  **same product in a different size**, not a mismatch: the gate records the
+  quantity ratio and the price is compared **per Naar unit** (a ₹259 pack-of-5 →
+  ₹51.8/unit vs Naar's ₹56). Only bails when sizes aren't comparable (stated on one
+  side) or the ratio is implausible.
 - **Variant attributes** (colour, numeric size) must appear as whole words in the
   title (`Teal` ≠ inside `Steal`; `8` ≠ inside `18`).
 - **Coverage vs unexplained ratio** — how much of the Naar identity the listing
@@ -212,6 +220,7 @@ Qwen / DeepSeek / Groq / OpenRouter / local Ollama).
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` | — / `claude-haiku-4-5` | Anthropic judge |
 | `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` | — / `https://api.openai.com/v1` / `gpt-4o-mini` | OpenAI-compatible judge |
 | `SELLER_PROFILE_LOOKUP` | off | fetch the marketplace seller-profile page to read legal name + GSTIN (confirms renamed sellers) |
+| `NAAR_KYC_FILE` | `poc/seller_identity.json` | path to the seller KYC export (GSTIN / legal name / store URLs / `not_on`) |
 | `NAAR_API_KEY` | — | optional `X-Api-Key` for the Naar API |
 | `MATCH_COVERAGE_FAIL` / `MATCH_COVERAGE_PASS` / `MATCH_MAX_UNEXPLAINED_RATIO` | `0.35` / `0.6` / `0.45` | product-gate tuning knobs |
 
