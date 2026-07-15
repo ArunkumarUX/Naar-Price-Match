@@ -108,13 +108,27 @@ Extraction is **structured only** — JSON-LD, Flipkart `__INITIAL_STATE__`, Mee
   `borderline`, never an auto-pass. Fuzzy similarity only *ranks*; it never *proves*.
 - Optional **LLM judge** adjudicates only the borderlines (never sets price/seller).
 
-**4 · Seller gate (`seller_gate`).** Per offer on a product-matched listing,
-compares the marketplace `Sold by` (+ registered legal name when available) against
-Naar's store + business names, after stripping only true legal suffixes
-(`PVT LTD` == `PRIVATE LIMITED`; word reordering handled by token-set equality).
-Only **exactness** is a `MATCH`; `[0.75, 1.0)` similarity is an `AMBIGUOUS` proposal
-(never upgraded); an identifiable different name is `OTHER`; a hidden seller is
-`AMBIGUOUS`.
+**4 · Seller gate (`seller_gate`) — confirm the seller even under a *different* name.**
+A seller can rebrand freely, but their tax id, registered legal name, and onboarded
+store URL don't change. The gate resolves identity in tiers, hardest signal first:
+
+| Tier | Signal | Verdict |
+|------|--------|---------|
+| 1 | **GSTIN** exact (unique govt tax id) | `MATCH` — same GSTIN ⇒ same seller, any brand name; different GSTIN ⇒ `OTHER` |
+| 2 | **Seller-provided store URL** == the listing's seller link | `MATCH` |
+| 3 | Registered **legal name** exact / token-set (`PVT LTD`==`PRIVATE LIMITED`, reordering) | `MATCH` |
+| 4 | Name **similarity** only | `AMBIGUOUS` proposal — never upgraded |
+
+Only tiers 1–3 (hard identifiers) become a `MATCH`; soft name similarity stays
+`AMBIGUOUS` for review — so **recall on renamed sellers goes up without faking a
+match**. Two inputs feed this:
+- **Onboarding map** — `poc/seller_identity.json` (see `seller_identity.example.json`,
+  gitignored): per-seller `gstin` / `businessName` / `brand` / `pincode` /
+  `<marketplace>_url`, collected once from the seller. Turns inference into a lookup.
+- **Seller-profile lookup** — `SELLER_PROFILE_LOOKUP=1` makes the Amazon adapter fetch
+  each seller's profile page and read the **legal name + GSTIN** from it, so a seller
+  listed under a different store name is still confirmed by hard id (best-effort;
+  a miss just leaves the row `AMBIGUOUS`).
 
 **5 · Decision → status.** Verdicts are collected across **all** matched
 candidates/offers, then one status is chosen (see legend below). The cheapest
@@ -191,6 +205,7 @@ Qwen / DeepSeek / Groq / OpenRouter / local Ollama).
 | `LLM_JUDGE_PROVIDER` | auto | `anthropic` \| `openai` |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` | — / `claude-haiku-4-5` | Anthropic judge |
 | `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` | — / `https://api.openai.com/v1` / `gpt-4o-mini` | OpenAI-compatible judge |
+| `SELLER_PROFILE_LOOKUP` | off | fetch the marketplace seller-profile page to read legal name + GSTIN (confirms renamed sellers) |
 | `NAAR_API_KEY` | — | optional `X-Api-Key` for the Naar API |
 | `MATCH_COVERAGE_FAIL` / `MATCH_COVERAGE_PASS` / `MATCH_MAX_UNEXPLAINED_RATIO` | `0.35` / `0.6` / `0.45` | product-gate tuning knobs |
 
@@ -214,6 +229,7 @@ A run writes to `--out` (default `poc_out/`):
 | `eval_accuracy.py` | Labeled accuracy harness over the matcher (offline). Reports status accuracy + the cardinal metric: **MATCHED precision / zero false matches**. |
 | `prove_llm.py` | End-to-end proof of the provider-agnostic judge against a local mock OpenAI-compatible server (no secrets, no network). |
 | `live_judge.py` | Live smoke test of the judge against a real vendor; provider/keys from env, prints only verdicts. |
+| `seller_identity.example.json` | Template for the per-seller onboarding map (`gstin` / legal name / store URLs) that confirms a seller under a different marketplace name. Copy to `seller_identity.json` (gitignored). |
 
 ---
 

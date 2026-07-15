@@ -99,6 +99,11 @@ class Offer:
     delivery_inr: Optional[float] = None   # evidence only
     in_stock: bool = True
     offer_ref: Optional[str] = None
+    # Hard-identity signals that survive a store/brand rename (from the seller
+    # profile page). These let us confirm the SAME seller under a DIFFERENT name.
+    seller_gstin: Optional[str] = None     # GST registration no. — unique govt id
+    seller_url: Optional[str] = None       # marketplace seller/store profile URL
+    seller_address: Optional[str] = None   # registered business address / pincode
 
 
 @dataclass
@@ -125,6 +130,7 @@ class Record:
     marketplace_selling_price: Optional[float] = None
     marketplace_sold_by: Optional[str] = None
     marketplace_seller_legal_name: Optional[str] = None
+    marketplace_seller_gstin: Optional[str] = None
     listing_id: Optional[str] = None
     listing_url: Optional[str] = None
     offer_ref: Optional[str] = None
@@ -200,6 +206,71 @@ def name_compare(observed: Optional[str], target: Optional[str]) -> tuple[float,
     if set(a.split()) == set(b.split()):              # fix 1: word reordering
         return 1.0, "token_set"
     return SequenceMatcher(None, a, b).ratio(), None
+
+
+# --- Seller identity beyond the display name ------------------------------
+# A seller can rebrand freely, but their GST id, registered legal name, and the
+# marketplace store URL they were onboarded with do not change. These let us
+# confirm the SAME seller under a DIFFERENT store/brand name.
+
+def _norm_gstin(s: Optional[str]) -> str:
+    """A GSTIN is 15 alphanumerics; compare case-insensitively, ignoring spaces."""
+    if not s:
+        return ""
+    g = re.sub(r"[^0-9a-z]", "", s.casefold())
+    return g if re.fullmatch(r"[0-9]{2}[a-z0-9]{13}", g) else ""
+
+
+def _seller_id_from_url(url: Optional[str]) -> str:
+    """Stable seller/store token from a marketplace seller URL, so a
+    seller-provided store URL matches the listing's seller link regardless of
+    tracking params (Amazon `seller=`, Flipkart/Meesho store slug)."""
+    if not url:
+        return ""
+    m = re.search(r"[?&]seller=([A-Z0-9]+)", url, re.I)           # Amazon
+    if m:
+        return "amazon:" + m.group(1).upper()
+    m = re.search(r"/seller/([^/?#]+)", url, re.I)                # generic /seller/<slug>
+    if m:
+        return "seller:" + m.group(1).lower()
+    m = re.search(r"(?:shop|supplier|store)/([^/?#]+)", url, re.I)  # Meesho/Flipkart store
+    if m:
+        return "store:" + m.group(1).lower()
+    return ""
+
+
+_seller_identity_cache: Optional[dict] = None
+
+
+def load_seller_identities() -> dict:
+    """Optional onboarding map: poc/seller_identity.json keyed by Naar sellerId ->
+    {gstin, businessName, brand, pincode, amazon_url, flipkart_url, meesho_url}.
+    This is the 'ask the seller once' input that turns inference into a lookup."""
+    global _seller_identity_cache
+    if _seller_identity_cache is not None:
+        return _seller_identity_cache
+    import pathlib
+    p = pathlib.Path(__file__).resolve().parent / "seller_identity.json"
+    try:
+        _seller_identity_cache = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        _seller_identity_cache = {}
+    return _seller_identity_cache
+
+
+def resolve_naar_seller(product: dict, marketplace: str) -> dict:
+    """Merge the product's inline seller block with the onboarding map, and pick
+    the store URL registered for THIS marketplace. Onboarding values fill gaps;
+    inline Naar data wins where both exist."""
+    seller = dict(product.get("seller") or {})
+    ident = load_seller_identities().get(str(product.get("sellerId") or ""), {})
+    for k in ("gstin", "brand", "pincode", "businessName", "storeName"):
+        if not seller.get(k) and ident.get(k):
+            seller[k] = ident[k]
+    url = ident.get(f"{marketplace}_url") or ident.get("store_url")
+    if url:
+        seller["store_url"] = url
+    return seller
 
 
 def content_tokens(s: str) -> set[str]:
@@ -665,6 +736,41 @@ def _amazon_visible_price(soup) -> Optional[float]:
     return None
 
 
+# GSTIN = 2 state digits, 5 PAN letters, 4 PAN digits, PAN check letter, entity
+# char, 'Z', checksum char. Matching this on a seller profile confirms identity
+# regardless of the store/brand name shown on the listing.
+_GSTIN_RE = re.compile(r"\b\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]\b")
+
+
+def _amazon_seller_profile(url: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Fetch an Amazon seller profile page and pull (legal_name, gstin, address)
+    from the 'Detailed Seller Information'. Best-effort: any miss returns None,
+    so a seller who differs only by display name can still be confirmed by GSTIN
+    / registered legal name. Never fabricates — parses labelled fields only."""
+    from bs4 import BeautifulSoup
+    pr = _http_get(url)
+    txt = BeautifulSoup(pr.text, "html.parser").get_text("\n", strip=True)
+    legal = None
+    m = re.search(r"Business Name\s*:?\s*(.+)", txt, re.I)
+    if m:
+        legal = (m.group(1).splitlines()[0].strip() or None)
+        if legal:
+            legal = legal[:80]
+    g = _GSTIN_RE.search(pr.text) or _GSTIN_RE.search(txt)
+    gstin = g.group(0) if g else None
+    addr = None
+    a = re.search(r"(?:Registered Address|Business Address|Address)\s*:?\s*(.+)", txt, re.I)
+    if a:
+        addr = (a.group(1).splitlines()[0].strip() or None)
+        if addr:
+            addr = addr[:200]
+    return legal, gstin, addr
+
+
+def _seller_profile_lookup_enabled() -> bool:
+    return os.environ.get("SELLER_PROFILE_LOOKUP", "").strip().lower() in ("1", "true", "yes")
+
+
 class AmazonInAdapter(MarketplaceAdapter):
     """Direct fallback for amazon.in. Search page -> product pages (JSON-LD)
     -> AOD endpoint for the full offer list. Blocks surface honestly: a failed
@@ -695,15 +801,23 @@ class AmazonInAdapter(MarketplaceAdapter):
 
     def _offers(self, asin: str) -> list[Offer]:
         from bs4 import BeautifulSoup
+        from urllib.parse import urljoin
         offers: list[Offer] = []
         pr = _http_get(f"https://www.amazon.in/dp/{asin}")
         soup = BeautifulSoup(pr.text, "html.parser")
+
+        # The buy-box "Sold by" seller-profile link — the anchor for GSTIN/legal
+        # lookup that confirms a seller trading under a different display name.
+        dp_seller_a = soup.select_one("#sellerProfileTriggerId, #merchant-info a, a[href*='seller=']")
+        dp_seller_url = urljoin("https://www.amazon.in", dp_seller_a.get("href")) \
+            if (dp_seller_a and dp_seller_a.get("href")) else None
 
         # Buy box via product page JSON-LD when present.
         for o in _jsonld_offers(pr.text):
             offers.append(Offer(seller_display=o.get("seller"),
                                 price_inr=_to_float(o.get("price")),
                                 in_stock="OutOfStock" not in str(o.get("availability")),
+                                seller_url=dp_seller_url,
                                 offer_ref=f"{asin}:buybox"))
 
         # Amazon.in often ships DP HTML with empty JSON-LD offers. Fall back to
@@ -716,6 +830,7 @@ class AmazonInAdapter(MarketplaceAdapter):
             seller = sold.get_text(strip=True) if sold else None
             if price is not None or seller:
                 offers.append(Offer(seller_display=seller, price_inr=price,
+                                    seller_url=dp_seller_url,
                                     offer_ref=f"{asin}:buybox_html"))
         elif not offers[0].seller_display:
             sold = (soup.select_one("#sellerProfileTriggerId")
@@ -730,14 +845,35 @@ class AmazonInAdapter(MarketplaceAdapter):
             asoup = BeautifulSoup(ar.text, "html.parser")
             for i, block in enumerate(asoup.select("#aod-offer")):
                 sold_by = block.select_one("#aod-offer-soldBy a, #aod-offer-soldBy .a-color-base")
+                sold_a = block.select_one("#aod-offer-soldBy a[href]")
                 price_el = block.select_one(".a-price .a-offscreen")
                 offers.append(Offer(
                     seller_display=sold_by.get_text(strip=True) if sold_by else None,
                     price_inr=_parse_inr(price_el.get_text()) if price_el else None,
+                    seller_url=urljoin("https://www.amazon.in", sold_a.get("href")) if sold_a else None,
                     offer_ref=f"{asin}:aod{i}"))
         except SourceError:
             if not offers:
                 raise
+
+        # Best-effort seller-identity enrichment (opt-in via SELLER_PROFILE_LOOKUP):
+        # pull legal name + GSTIN from each distinct seller profile so the seller
+        # gate can confirm a DIFFERENT-NAMED seller by hard id. Failures are silent.
+        if _seller_profile_lookup_enabled():
+            seen: dict[str, tuple] = {}
+            for off in offers:
+                if not off.seller_url or off.seller_gstin:
+                    continue
+                if off.seller_url not in seen:
+                    try:
+                        seen[off.seller_url] = _amazon_seller_profile(off.seller_url)
+                    except SourceError:
+                        seen[off.seller_url] = (None, None, None)
+                legal, gstin, addr = seen[off.seller_url]
+                off.seller_legal = off.seller_legal or legal
+                off.seller_gstin = off.seller_gstin or gstin
+                off.seller_address = off.seller_address or addr
+
         if not offers:
             raise SourceError(f"no offers extracted for {asin}")
         return offers
@@ -1230,11 +1366,30 @@ def _llm_same_product(naar_text: str, listing_title: str) -> Optional[bool]:
 
 def seller_gate(naar_seller: dict, offer: Offer) -> tuple[str, float, str]:
     """Returns (verdict, confidence, signal). Verdict: MATCH | OTHER | AMBIGUOUS.
-    Only exactness (after conservative normalisation, or token-set equality)
-    is a match. Similarity in [0.75, 1.0) is a proposal (AMBIGUOUS); below
-    that, an identifiable name counts towards OTHER."""
+
+    Tiered identity resolution — confirms the SAME seller even under a DIFFERENT
+    store/brand name, hardest signal first:
+      1. GSTIN exact            — unique govt tax id, survives any rename
+      2. seller-provided store URL == the listing's seller link
+      3. registered legal name  — exact / token-set (reordering, PVT==PRIVATE)
+      4. name similarity        — a proposal only (AMBIGUOUS), never a match
+    Only tiers 1–3 are a MATCH; anything softer stays AMBIGUOUS (human review)."""
     store = naar_seller.get("storeName") or ""
     legal = naar_seller.get("businessName") or ""
+
+    # Tier 1 — GSTIN. A hard, rename-proof identifier.
+    n_gstin, o_gstin = _norm_gstin(naar_seller.get("gstin")), _norm_gstin(offer.seller_gstin)
+    if n_gstin and o_gstin:
+        if n_gstin == o_gstin:
+            return "MATCH", 0.99, "gstin_exact"
+        return "OTHER", 0.99, "gstin_differs"      # both known and different -> definitely not
+
+    # Tier 2 — seller-provided store URL matches the listing's seller link.
+    n_sid, o_sid = _seller_id_from_url(naar_seller.get("store_url")), _seller_id_from_url(offer.seller_url)
+    if n_sid and o_sid and n_sid == o_sid:
+        return "MATCH", 0.98, "store_url_match"
+
+    # Tiers 3–4 — legal / display name.
     best_verdict: Optional[str] = None   # None until an identifiable comparison happens
     best_conf, best_sig = 0.0, ""
 
@@ -1311,7 +1466,7 @@ def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
 
     # Fix 4/6: collect verdicts across ALL matched candidates and offers,
     # then decide — nothing returns early on the first offer it sees.
-    seller = product.get("seller") or {}
+    seller = resolve_naar_seller(product, adapter.name)
     matched_offers: list[tuple[Candidate, Offer, float, str, str]] = []
     ambiguous_best: Optional[Record] = None
     saw_other = False
@@ -1344,6 +1499,7 @@ def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
                           marketplace_selling_price=offer.price_inr,
                           marketplace_sold_by=offer.seller_display,
                           marketplace_seller_legal_name=offer.seller_legal,
+                          marketplace_seller_gstin=offer.seller_gstin,
                           listing_id=cand.listing_id, listing_url=cand.listing_url,
                           offer_ref=offer.offer_ref,
                           delivery_charge=offer.delivery_inr, mrp_displayed=offer.mrp_inr,
@@ -1476,6 +1632,25 @@ def self_test() -> int:
     v, c, s = seller_gate({"storeName": "", "businessName": "Flavours Treasure Foods Ltd"},
                           Offer(seller_display="Treasure Flavours Foods"))
     check("word reordering matches via token_set", v == "MATCH" and "token_set" in s)
+
+    # 1b. Seller identity beyond the display name (GSTIN / store URL).
+    naar = {"storeName": "Kaithari Kalanjiyam", "businessName": "NITHYA VINOTH KUMAR",
+            "gstin": "33ABCDE1234F1Z5"}
+    v, c, s = seller_gate(naar, Offer(seller_display="Totally Different Store Name",
+                                      seller_gstin="33ABCDE1234F1Z5"))
+    check("same GSTIN under a DIFFERENT display name -> MATCH", v == "MATCH" and s == "gstin_exact")
+    v, c, s = seller_gate(naar, Offer(seller_display="Kaithari Kalanjiyam",
+                                      seller_gstin="27ZZZZZ9999Z1Z9"))
+    check("different GSTIN (even with matching name) -> OTHER", v == "OTHER" and s == "gstin_differs")
+    v, _, _ = seller_gate({"gstin": "33 abcde 1234 f1z5"},
+                          Offer(seller_display="x", seller_gstin="33ABCDE1234F1Z5"))
+    check("GSTIN normalised (spaces/case) still matches", v == "MATCH")
+    v, c, s = seller_gate(
+        {"storeName": "Brand A", "store_url": "https://www.amazon.in/sp?seller=A1B2C3D4E5"},
+        Offer(seller_display="Reseller Marketing",
+              seller_url="https://www.amazon.in/sp?seller=A1B2C3D4E5&ref=x"))
+    check("seller-provided store URL matches listing's seller link -> MATCH",
+          v == "MATCH" and s == "store_url_match")
 
     # 2. Word-boundary attributes
     verdict, _ = product_gate({"title": "Kanchipuram Silk Cotton Saree", "description": ""},

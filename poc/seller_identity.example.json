@@ -1,0 +1,12 @@
+{
+  "_comment": "Onboarding map: confirm a Naar seller on a marketplace even when they trade under a DIFFERENT store/brand name. Copy to seller_identity.json (gitignored) and fill from what each seller provides once. Keyed by Naar sellerId. All fields optional — any hard signal present is used, strongest first (GSTIN > store URL > legal name).",
+  "ns_example_seller_id": {
+    "businessName": "REGISTERED LEGAL NAME PRIVATE LIMITED",
+    "gstin": "33ABCDE1234F1Z5",
+    "brand": "TheirBrand",
+    "pincode": "600001",
+    "amazon_url": "https://www.amazon.in/sp?seller=A1B2C3D4E5XYZ",
+    "flipkart_url": "https://www.flipkart.com/seller/xxxxx",
+    "meesho_url": "https://www.meesho.com/shop/their-store-slug"
+  }
+}
