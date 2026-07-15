@@ -7,6 +7,74 @@ product gate and the seller gate pass. Every row carries an honest status; a
 marketplace price is written **only** on `MATCHED` rows, from structured offer
 data, never a guess.
 
+## How it works
+
+The core problem: Naar has **no** marketplace store URL or seller ID, so we can't
+start from "this seller's catalog". Instead we search each marketplace for the
+product, then **confirm two things independently** on each candidate listing —
+that it's the exact product/variant, *and* that it's sold by the same seller.
+Both gates must pass before a price is recorded.
+
+```mermaid
+flowchart TD
+    A[Naar products API] --> B[Per variant: build search query]
+    B --> C[Marketplace adapter: search -> candidate listings + offers]
+    C --> D{Product gate<br/>exact product & variant?}
+    D -->|no candidate passes| E[PRODUCT_NOT_FOUND]
+    D -->|only borderline| F[AMBIGUOUS_MATCH]
+    D -->|pass| G{Seller gate<br/>sold-by == Naar seller?}
+    G -->|different seller| H[SOLD_BY_OTHER]
+    G -->|hidden / near-miss| F
+    G -->|match, in stock, price| I[MATCHED + price]
+    G -->|match, out of stock| J[OUT_OF_STOCK]
+    G -->|match, price unextractable| K[SOURCE_ERROR]
+```
+
+**1 · Input (`fetch_naar_products`, `iter_variants`).** Pull active products from
+the Naar products API, one row **per variant**. The Naar comparison price is the
+variant's `sellingPrice` (INR) — `price` / `priceWithoutTax` / MRP are kept as
+evidence but never coalesced into it. The seller identity we must confirm is the
+product's `seller.storeName` (brand) and `seller.businessName` (legal entity).
+
+**2 · Search (`MarketplaceAdapter.search`).** One adapter per marketplace
+(Amazon.in, Flipkart, Meesho) builds a query from the product title + variant
+signals and returns `Candidate` listings, each carrying its `Offer`s (the
+`Sold by` name and the purchasable price). Extraction is **structured only** —
+JSON-LD, Flipkart `__INITIAL_STATE__`, Meesho `__NEXT_DATA__` — never a
+regex-first-price grab. Meesho / blocked hosts go through ScraperAPI when
+`SCRAPERAPI_KEY` is set.
+
+**3 · Product gate (`product_gate`).** Per candidate, returns `pass` / `fail` /
+`borderline`:
+- **Quantity** must agree when Naar states one (100g vs 250g → `fail`).
+- **Variant attributes** (colour, numeric size) must appear as whole words in the
+  listing title (`Teal` must not match inside `Steal`; `8` must not match inside
+  `18`).
+- **Coverage vs unexplained ratio** — how much of the Naar identity the listing
+  contains, and how much of the listing is content Naar can't explain. A
+  derivative (`Amla Powder Hair Mask` vs `Amla Powder`) is dominated by
+  unexplained tokens → `borderline`, never an auto-pass. Fuzzy similarity only
+  *ranks* candidates; it never *proves* a match. HSN text is never used.
+
+**4 · Seller gate (`seller_gate`).** Per offer on a product-matched listing,
+compares the marketplace `Sold by` (and registered legal name, when available)
+against Naar's store + business names, after stripping only true legal suffixes
+(`PVT LTD` == `PRIVATE LIMITED`; word reordering handled by token-set equality).
+Only **exactness** is a `MATCH`; similarity in `[0.75, 1.0)` is an `AMBIGUOUS`
+proposal (never upgraded to a match); an identifiable different name is `OTHER`;
+a hidden seller is `AMBIGUOUS`.
+
+**5 · Decision → status.** Verdicts are collected across **all** matched
+candidates/offers, then one status is chosen:
+`MATCHED` (both gates pass, in stock, price present — cheapest matched offer wins)
+· `OUT_OF_STOCK` · `SOURCE_ERROR` (seller matched but price unextractable, or an
+offer fetch failed) · `SOLD_BY_OTHER` · `AMBIGUOUS_MATCH` · `PRODUCT_NOT_FOUND`.
+
+**Price integrity (the cardinal rule).** A marketplace price is recorded **only**
+on `MATCHED`, and only from the matched seller's structured offer. Never a
+guessed price, a homepage/catalogue-minimum figure, or a query-as-title
+self-match. A variant with no `sellingPrice` is skipped, never recorded as ₹0.
+
 ## Files
 
 | File | What it is |
