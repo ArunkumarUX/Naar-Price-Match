@@ -868,6 +868,68 @@ def _amazon_profile_url(soup_or_el) -> Optional[str]:
     return None
 
 
+# --- Structured-data API path (reliable JSON, no HTML parsing / no Selenium) ---
+# ScraperAPI's structured endpoints return parsed product/price/seller JSON, which
+# eliminates the ~55% Selenium SOURCE_ERROR seen at scale and our fragile parsers.
+
+def _use_amazon_structured() -> bool:
+    return (os.environ.get("SCRAPERAPI_STRUCTURED", "").strip().lower() in ("1", "true", "yes")
+            and bool(os.environ.get("SCRAPERAPI_KEY", "").strip()))
+
+
+def _scraperapi_structured(kind: str, params: dict) -> dict:
+    """GET a ScraperAPI structured-data endpoint (e.g. 'amazon/search',
+    'amazon/product') and return parsed JSON. Honest failures -> SourceError."""
+    if requests is None:
+        raise SourceError("requests not installed")
+    key = os.environ.get("SCRAPERAPI_KEY", "").strip()
+    if not key:
+        raise SourceError("SCRAPERAPI_KEY required for structured endpoints")
+    try:
+        r = requests.get(f"https://api.scraperapi.com/structured/{kind}",
+                         params={"api_key": key, "country": "in", "tld": "in", **params},
+                         timeout=90)
+    except Exception as e:
+        raise SourceError(f"structured fetch failed: {_redact_secrets(str(e))}") from e
+    if r.status_code == 403 and "credit" in r.text.lower():
+        raise SourceError("ScraperAPI credits exhausted")
+    if r.status_code >= 400:
+        raise SourceError(f"structured HTTP {r.status_code}")
+    try:
+        return r.json()
+    except ValueError as e:
+        raise SourceError(f"structured non-JSON body: {e}") from e
+
+
+def _amazon_structured_candidates(search_json: dict, marketplace: str, limit: int = 5) -> list[Candidate]:
+    """Parse the structured amazon/search JSON into candidates. Pure/testable."""
+    out: list[Candidate] = []
+    for it in (search_json.get("results") or [])[:limit * 2]:
+        if not isinstance(it, dict):
+            continue
+        asin = str(it.get("asin") or "").strip()
+        name = it.get("name") or it.get("title") or ""
+        if not asin or not name:
+            continue
+        out.append(Candidate(marketplace, asin, f"https://www.amazon.in/dp/{asin}", name))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _amazon_structured_offer(product_json: dict, asin: str) -> Offer:
+    """Parse the structured amazon/product JSON into an Offer (price + seller +
+    MRP + stock), directly — no HTML. Pure/testable."""
+    price = _parse_inr(str(product_json.get("pricing") or "")) \
+        or _to_float(product_json.get("price"))
+    mrp = _parse_inr(str(product_json.get("list_price") or ""))
+    sold = product_json.get("sold_by") or None
+    avail = str(product_json.get("availability_status") or "").lower()
+    in_stock = not any(t in avail for t in ("unavailable", "out of stock", "currently unavailable"))
+    return Offer(seller_display=sold, price_inr=price, mrp_inr=mrp,
+                 in_stock=in_stock, offer_ref=f"{asin}:structured")
+
+
 class AmazonInAdapter(MarketplaceAdapter):
     """Direct fallback for amazon.in. Search page -> product pages (JSON-LD)
     -> AOD endpoint for the full offer list. Blocks surface honestly: a failed
@@ -876,6 +938,8 @@ class AmazonInAdapter(MarketplaceAdapter):
     AOD = "https://www.amazon.in/gp/product/ajax/ref=aod_f_new?asin={asin}&pc=dp&experienceId=aodAjaxMain"
 
     def search(self, query: str) -> list[Candidate]:
+        if _use_amazon_structured():
+            return self._search_structured(query)
         from bs4 import BeautifulSoup
         r = _http_get("https://www.amazon.in/s", params={"k": query})
         soup = BeautifulSoup(r.text, "html.parser")
@@ -894,6 +958,20 @@ class AmazonInAdapter(MarketplaceAdapter):
             except SourceError as e:
                 c.offers, c.offers_error = [], str(e)      # fix 6
             time.sleep(1.0)  # be polite; this is a 10-product POC, not a crawler
+        return cands
+
+    def _search_structured(self, query: str) -> list[Candidate]:
+        """Reliable path: ScraperAPI structured JSON — search then per-candidate
+        product (price + sold_by), no HTML parsing. A failed product lookup is
+        recorded on the candidate, not swallowed."""
+        cands = _amazon_structured_candidates(
+            _scraperapi_structured("amazon/search", {"query": query}), self.name)
+        for c in cands:
+            try:
+                d = _scraperapi_structured("amazon/product", {"asin": c.listing_id})
+                c.offers = [_amazon_structured_offer(d, c.listing_id)]
+            except SourceError as e:
+                c.offers, c.offers_error = [], str(e)
         return cands
 
     def _offers(self, cand: Candidate) -> list[Offer]:
@@ -1929,6 +2007,24 @@ def self_test() -> int:
     rec = compare_variant(gp, gv, GtinStub(), False)
     check("GTIN-matched listing MATCHED even with an unrelated title",
           rec.status == "MATCHED" and rec.marketplace_selling_price == 88.0)
+
+    # 11d. Structured API parsers (reliable JSON path — no HTML/Selenium).
+    sj = {"results": [{"asin": "B0G5YXPFYC", "name": "Earthen Story Amla Powder 200g"},
+                      {"asin": "", "name": "skip empty asin"},
+                      {"asin": "B02", "name": "Second"}]}
+    cands = _amazon_structured_candidates(sj, "amazon_in", limit=5)
+    check("structured search parses candidates, skips empty asin",
+          len(cands) == 2 and cands[0].listing_id == "B0G5YXPFYC")
+    pj = {"name": "Earthen Story Amla Powder 200g", "pricing": "₹249",
+          "list_price": "₹325", "sold_by": "EarthenStory", "availability_status": "In stock"}
+    off = _amazon_structured_offer(pj, "B0G5YXPFYC")
+    check("structured product parses price/seller/mrp/stock directly",
+          off.price_inr == 249.0 and off.seller_display == "EarthenStory"
+          and off.mrp_inr == 325.0 and off.in_stock)
+    off2 = _amazon_structured_offer({"pricing": "", "availability_status": "Currently unavailable",
+                                     "sold_by": "X"}, "A")
+    check("structured out-of-stock / no price parsed honestly",
+          off2.in_stock is False and off2.price_inr is None)
 
     # 12. Borderline judge is provider-agnostic and honest when unconfigured.
     check("judge parses a structured same_product verdict",
