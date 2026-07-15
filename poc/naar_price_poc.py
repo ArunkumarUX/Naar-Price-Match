@@ -511,13 +511,15 @@ def _http_get(url: str, **kw) -> "requests.Response":
         os.environ.get("SCRAPERAPI_ALL", "").strip() in ("1", "true", "yes")
         or host.endswith("meesho.com")
     )
+    # Selenium handles the hosts it can (Amazon/Flipkart); Meesho is behind Akamai
+    # and Selenium can't pass it, so route Meesho to ScraperAPI whenever a key is
+    # set — even with USE_SELENIUM on. This makes one `--marketplaces amazon_in
+    # flipkart meesho` run do the right thing per host.
+    selenium_on = _selenium_enabled() and not (host.endswith("meesho.com") and use_proxy)
     try:
-        if _selenium_enabled():
+        if selenium_on:
             full = _merge_url_params(url, params)
-            w = wait_ms
-            if w is None and host.endswith("meesho.com"):
-                w = 6000            # give Meesho's client-side search XHR time
-            r = _Resp(_selenium_get(full, wait_ms=w, timeout=timeout))
+            r = _Resp(_selenium_get(full, wait_ms=wait_ms, timeout=timeout))
         elif use_proxy:
             url = _merge_url_params(url, params)
             if render_override is None:
@@ -1614,7 +1616,30 @@ def self_test() -> int:
     return 1 if failures else 0
 
 
+def _load_dotenv() -> None:
+    """Load KEY=VALUE lines from a .env beside this script (else the CWD) into
+    os.environ WITHOUT overriding anything already set. Zero-dependency: simple
+    KEY=VALUE, ignores blanks / #comments, strips surrounding quotes. Keeps
+    secrets (SCRAPERAPI_KEY, API keys) out of the code and out of argv."""
+    import pathlib
+    here = pathlib.Path(__file__).resolve().parent
+    for p in (here / ".env", pathlib.Path.cwd() / ".env"):
+        try:
+            text = p.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+
+
 def main():
+    _load_dotenv()
     ap = argparse.ArgumentParser(description="Naar price-matching POC (v3)")
     ap.add_argument("--backend", choices=["fixture", "direct"], default="fixture")
     ap.add_argument("--limit", type=int, default=10)
