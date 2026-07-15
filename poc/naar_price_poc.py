@@ -134,6 +134,7 @@ class Record:
     marketplace_sold_by: Optional[str] = None
     marketplace_seller_legal_name: Optional[str] = None
     marketplace_seller_gstin: Optional[str] = None
+    other_sellers: Optional[str] = None        # SOLD_BY_OTHER: who IS selling it + their price
     listing_id: Optional[str] = None
     listing_url: Optional[str] = None
     offer_ref: Optional[str] = None
@@ -1648,7 +1649,7 @@ def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
     seller = resolve_naar_seller(product, adapter.name)
     matched_offers: list[tuple[Candidate, Offer, float, str, str]] = []
     ambiguous_best: Optional[Record] = None
-    saw_other = False
+    other_offers: list[tuple[Candidate, Offer]] = []   # same product, different seller
     offers_failed = [c.offers_error for c, _ in product_matched if c.offers_error]
 
     for cand, pevidence in product_matched:
@@ -1667,8 +1668,8 @@ def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
                              match_evidence=pevidence)
                 if ambiguous_best is None or (conf or 0) > (ambiguous_best.confidence or 0):
                     ambiguous_best = rec
-            else:
-                saw_other = True
+            elif offer.seller_display:            # OTHER: a nameable different seller
+                other_offers.append((cand, offer))
 
     # Per-unit normalisation: compare listings on price-per-Naar-unit so a
     # multipack/larger size is apples-to-apples with Naar's single unit.
@@ -1736,12 +1737,32 @@ def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
                                      "listing: " + "; ".join(offers_failed))
     if ambiguous_best:          # never upgraded to MATCHED (§4)
         return ambiguous_best
-    if saw_other:
+    if other_offers:
+        # Same product, a DIFFERENT seller — name who is selling it and at what
+        # price (competitive intel), and normalise their price per Naar unit.
+        # This is NOT our match price, so it goes in `other_sellers`, and the
+        # MATCHED-only price fields stay empty.
+        def _summ(t) -> str:
+            c, o = t
+            r = quantity_ratio(_n_attrs, extract_attrs(c.title))
+            up = per_unit_price(o.price_inr, r)
+            price = f"₹{up:.2f}/unit" if up is not None else "price n/a"
+            if r and abs(r - 1.0) > 1e-6 and o.price_inr is not None:
+                price += f" (₹{o.price_inr:.0f}÷{r:.3g})"
+            return f"{o.seller_display} @ {price}"
+        ranked = sorted(other_offers,
+                        key=lambda t: _unit_of(t) if t[1].price_inr is not None else 1e18)
+        top = ranked[0]
         return Record(**base, status="SOLD_BY_OTHER",
+                      marketplace_sold_by=top[1].seller_display,
+                      marketplace_seller_legal_name=top[1].seller_legal,
+                      listing_id=top[0].listing_id, listing_url=top[0].listing_url,
+                      offer_ref=top[1].offer_ref,
                       product_match_method="attribute_gate",
                       seller_match_signal="sold_by_name",
-                      match_evidence="product found; every identifiable offer "
-                                     "belongs to a different seller")
+                      other_sellers="; ".join(_summ(t) for t in ranked[:5]),
+                      match_evidence="product found; sold by a different seller — "
+                                     "see other_sellers")
     return Record(**base, status="AMBIGUOUS_MATCH",
                   product_match_method="attribute_gate",
                   seller_match_signal="seller_hidden",
@@ -1787,6 +1808,8 @@ def run(args) -> list[Record]:
                         norm = f" [₹{rec.marketplace_selling_price:.2f}/{rec.qty_ratio:.3g}u]"
                     delta = (f"  naar ₹{rec.naar_selling_price:.2f} vs ₹{cmp_price:.2f}/unit"
                              f"{norm} (Δ {d:+.2f})")
+                elif rec.status == "SOLD_BY_OTHER" and rec.other_sellers:
+                    delta = f"  by {rec.other_sellers[:60]}"
                 print(f"[{rec.status:<17}] {product.get('title','')[:34]:<34} "
                       f"({variant.get('variantName') or '-'}) @ {m}{delta}")
     return records
@@ -1863,6 +1886,23 @@ def self_test() -> int:
           seller_present_on("meesho", {"not_on": ["meesho"]}) is False)
     check("no KYC signal -> unknown (search as usual)",
           seller_present_on("flipkart", {"storeName": "X"}) is None)
+
+    # 1d. SOLD_BY_OTHER names WHO is selling it + their (per-unit) price.
+    class OtherStub(MarketplaceAdapter):
+        name = "amazon_in"
+        def search(self, q):
+            return [Candidate("amazon_in", "O", "http://x/O", "Amla Powder 100g",
+                              [Offer("KPN Foods", None, 425.0, offer_ref="O:o")])]
+    amla_p = {"_id": "n", "title": "Amla Powder", "description": "Pure amla powder 100g",
+              "seller": {"storeName": "Treasure Flavours",
+                         "businessName": "TREASURE FLAVOURS FOODS PRIVATE LIMITED"}}
+    amla_v = {"_id": "v", "attributes": {"weight": "100g"}, "variantName": "100g",
+              "sellingPrice": 56.0}
+    rec = compare_variant(amla_p, amla_v, OtherStub(), False)
+    check("SOLD_BY_OTHER names the other seller + price (competitive intel)",
+          rec.status == "SOLD_BY_OTHER" and rec.marketplace_sold_by == "KPN Foods"
+          and "KPN Foods" in (rec.other_sellers or "")
+          and rec.marketplace_selling_price is None)
 
     # 2. Word-boundary attributes
     verdict, _ = product_gate({"title": "Kanchipuram Silk Cotton Saree", "description": ""},
