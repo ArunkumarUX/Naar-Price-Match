@@ -126,6 +126,9 @@ class Record:
     marketplace: str
     status: str
     naar_selling_price: float
+    naar_product_title: str = ""     # human-readable, for shareable output
+    naar_variant_name: str = ""
+    naar_seller_name: str = ""
     search_query: Optional[str] = None     # reproducibility evidence (fix 9)
     currency: str = "INR"
     marketplace_selling_price: Optional[float] = None      # raw listing price
@@ -1621,6 +1624,9 @@ def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
                 naar_seller_id=product.get("sellerId", ""),
                 marketplace=adapter.name,
                 naar_selling_price=float(variant["sellingPrice"]),
+                naar_product_title=product.get("title", ""),
+                naar_variant_name=variant.get("variantName") or variant.get("variantOption") or "",
+                naar_seller_name=(product.get("seller") or {}).get("storeName", ""),
                 search_query=query)
 
     try:
