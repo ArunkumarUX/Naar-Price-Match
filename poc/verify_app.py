@@ -87,26 +87,38 @@ async function load(){
   tr.innerHTML=cells;tb.appendChild(tr);
  }
 }
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 async function verify(sid,m){
  const cell=document.getElementById(`c_${sid}_${m}`);
- cell.insertAdjacentHTML('beforeend','<div class=cands>searching…</div>');
- const box=cell.querySelector('.cands');
- const store=document.querySelector(`#c_${sid}_${m}`).closest('tr').querySelector('b').textContent;
+ let box=cell.querySelector('.cands');
+ if(box)box.remove();                       // fix: replace, never stack multiple result boxes
+ box=document.createElement('div');box.className='cands';box.textContent='searching…';
+ cell.appendChild(box);
  const cs=await j(`/api/propose?seller=${encodeURIComponent(sid)}&marketplace=${m}`);
- let h='';
- if(cs.error){h=`<div class=muted>could not search: ${cs.error}</div>`}
- else if(!cs.length){h='<div class=muted>no candidate sellers found</div>'}
- else for(const c of cs){h+=`<div class=cand><div>${c.seller_display} <span class=muted>(sim ${c.similarity})<br>e.g. ${(c.sample_title||'').slice(0,54)} ${c.sample_listing?`· <a href="${c.sample_listing}" target=_blank>listing</a>`:''}</span></div>
-   <button class=primary onclick='confirmStore("${sid}","${m}",${JSON.stringify(c.store_url||"")},${JSON.stringify(c.seller_display)})'>Confirm</button></div>`}
- h+=`<div class=cand><input type=text id="u_${sid}_${m}" placeholder="…or paste the correct store URL">
-   <button onclick='confirmUrl("${sid}","${m}")'>Confirm URL</button></div>`;
- box.innerHTML=h;
+ box.textContent='';
+ if(cs.error){box.innerHTML=`<div class=muted>could not search: ${esc(cs.error)}</div>`}
+ else if(!cs.length){box.innerHTML='<div class=muted>no candidate sellers found</div>'}
+ else for(const c of cs){
+   const row=document.createElement('div');row.className='cand';
+   const info=document.createElement('div');
+   info.innerHTML=`${esc(c.seller_display)} <span class=muted>(sim ${esc(String(c.similarity))})<br>e.g. ${esc((c.sample_title||'').slice(0,54))} ${c.sample_listing?`· <a href="${esc(c.sample_listing)}" target=_blank>listing</a>`:''}</span>`;
+   const btn=document.createElement('button');btn.className='primary';btn.textContent='Confirm';
+   btn.onclick=()=>confirmStore(sid,m,c.store_url||"",c.seller_display);   // closure: real values, no HTML-attr injection
+   row.appendChild(info);row.appendChild(btn);box.appendChild(row);
+ }
+ const urow=document.createElement('div');urow.className='cand';
+ const inp=document.createElement('input');inp.type='text';inp.id=`u_${sid}_${m}`;inp.placeholder='…or paste the correct store URL';
+ const ubtn=document.createElement('button');ubtn.textContent='Confirm URL';ubtn.onclick=()=>confirmUrl(sid,m);
+ urow.appendChild(inp);urow.appendChild(ubtn);box.appendChild(urow);
 }
 async function confirmStore(sid,m,url,disp){
  await j('/api/confirm',{method:'POST',body:JSON.stringify({seller_id:sid,marketplace:m,store_url:url,seller_display:disp})});load();}
 async function confirmUrl(sid,m){
  const url=document.getElementById(`u_${sid}_${m}`).value.trim();if(!url)return;
- await j('/api/confirm',{method:'POST',body:JSON.stringify({seller_id:sid,marketplace:m,store_url:url})});load();}
+ // Also carry the Naar store name: Amazon's structured API matches offers by the
+ // Sold-by NAME (not a URL), so a URL-only confirm would never match live.
+ const name=document.getElementById(`c_${sid}_${m}`).closest('tr').querySelector('b').textContent.trim();
+ await j('/api/confirm',{method:'POST',body:JSON.stringify({seller_id:sid,marketplace:m,store_url:url,seller_display:name})});load();}
 async function reject(sid,m){await j('/api/reject',{method:'POST',body:JSON.stringify({seller_id:sid,marketplace:m})});load();}
 load();
 </script>"""
@@ -128,30 +140,35 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         if u.path == "/":
             return self._send(200, PAGE, "text/html; charset=utf-8")
-        if u.path == "/api/sellers":
-            return self._send(200, json.dumps(sellers_with_status()))
-        if u.path == "/api/propose":
-            q = parse_qs(u.query)
-            sid = (q.get("seller") or [""])[0]
-            m = (q.get("marketplace") or [""])[0]
-            seller = next((s for s in load_naar_sellers() if s["seller_id"] == sid), None)
-            name = (seller or {}).get("store_name") or (seller or {}).get("business_name") or ""
-            if not name:
-                return self._send(200, json.dumps({"error": "seller has no store/business name"}))
-            with _lock:
-                cands = poc.propose_stores(name, m, _adapter(m))
-            if cands and cands[0].get("error"):
-                return self._send(200, json.dumps({"error": cands[0]["error"]}))
-            return self._send(200, json.dumps(cands))
+        try:                                     # a corrupt registry -> 500 JSON, not a crashed handler
+            if u.path == "/api/sellers":
+                return self._send(200, json.dumps(sellers_with_status()))
+            if u.path == "/api/propose":
+                q = parse_qs(u.query)
+                sid = (q.get("seller") or [""])[0]
+                m = (q.get("marketplace") or [""])[0]
+                seller = next((s for s in load_naar_sellers() if s["seller_id"] == sid), None)
+                name = (seller or {}).get("store_name") or (seller or {}).get("business_name") or ""
+                if not name:
+                    return self._send(200, json.dumps({"error": "seller has no store/business name"}))
+                with _lock:
+                    cands = poc.propose_stores(name, m, _adapter(m))
+                if cands and cands[0].get("error"):
+                    return self._send(200, json.dumps({"error": cands[0]["error"]}))
+                return self._send(200, json.dumps(cands))
+        except poc.SourceError as e:
+            return self._send(500, json.dumps({"error": str(e)}))
         return self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):
         u = urlparse(self.path)
-        n = int(self.headers.get("content-length", 0))
         try:
+            n = int(self.headers.get("content-length", 0) or 0)   # bad header -> 400, not a crash
             body = json.loads(self.rfile.read(n) or b"{}")
-        except json.JSONDecodeError:
-            return self._send(400, json.dumps({"error": "bad json"}))
+        except (ValueError, json.JSONDecodeError):
+            return self._send(400, json.dumps({"error": "bad request body"}))
+        if not isinstance(body, dict):                            # JSON null/array/scalar -> 400
+            return self._send(400, json.dumps({"error": "body must be a JSON object"}))
         try:
             if u.path == "/api/confirm":
                 poc.confirm_store(body["seller_id"], body["marketplace"],
@@ -160,7 +177,9 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/reject":
                 poc.reject_store(body["seller_id"], body["marketplace"])
                 return self._send(200, json.dumps({"ok": True}))
-        except (KeyError, ValueError) as e:
+        except poc.SourceError as e:                              # e.g. corrupt registry
+            return self._send(500, json.dumps({"error": str(e)}))
+        except (KeyError, ValueError, TypeError) as e:            # missing/typed-wrong fields
             return self._send(400, json.dumps({"error": str(e)}))
         return self._send(404, json.dumps({"error": "not found"}))
 

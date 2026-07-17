@@ -120,13 +120,15 @@ class BorderlineStub(poc.MarketplaceAdapter):
             "amazon_in", "C1", "u1", "Amla Powder Hair Mask 100g",
             [poc.Offer("Treasure Flavours", None, 199.0, offer_ref="C1:o")])]
 
+# store-first: the seller ("Treasure Flavours") is the human-confirmed store.
+STORE = {"store_id": "", "store_url": "", "seller_display": "Treasure Flavours"}
 STATE.update(content='{"same_product": false}')
-rec_f = poc.compare_variant(amla, amla["variants"][0], BorderlineStub(), llm_judge=True)
+rec_f = poc.compare_variant(amla, amla["variants"][0], BorderlineStub(), llm_judge=True, store=STORE)
 check("compare_variant: judge=false -> PRODUCT_NOT_FOUND, no price",
       rec_f.status == "PRODUCT_NOT_FOUND" and rec_f.marketplace_selling_price is None)
 STATE.update(content='{"same_product": true}')
-rec_t = poc.compare_variant(amla, amla["variants"][0], BorderlineStub(), llm_judge=True)
-check("compare_variant: judge=true + matched seller -> MATCHED @ ₹199",
+rec_t = poc.compare_variant(amla, amla["variants"][0], BorderlineStub(), llm_judge=True, store=STORE)
+check("compare_variant: judge=true + in confirmed store -> MATCHED @ ₹199",
       rec_t.status == "MATCHED" and rec_t.marketplace_selling_price == 199.0)
 
 httpd.shutdown()

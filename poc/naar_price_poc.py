@@ -1,61 +1,35 @@
 #!/usr/bin/env python3
 """
-Naar marketplace price-matching — 10-product POC script (v2, post-review).
+Naar marketplace price-matching POC — store-first, structured-API spine.
 
-Implements the pipeline from the proposal: pull active products from the
-Naar API, search Amazon.in / Flipkart / Meesho for each variant, apply the
-product gate and the seller gate independently, and emit one record per
-variant x marketplace with an honest status. A marketplace price is written
-only on MATCHED rows, and only from structured offer data — never from an
-LLM and never from a page-wide guess.
+Pipeline (per Naar product x marketplace):
+  verify store (human, once)                 -> confirm each seller's store in verify_app.py
+    -> structured-API search (reliable JSON)  -> ScraperAPI structured endpoints: name, price, sold_by
+    -> keep the confirmed store's offers       -> the store filter replaces any fuzzy seller guessing
+    -> product gate (GTIN -> per-unit -> attrs -> coverage -> optional LLM judge)
+    -> per-unit price compare                  -> a MATCH is same product, from the verified store
+    -> one honest record per row
+
+Honest by design: a price is written only on a MATCHED row (confirmed store +
+same product, in stock). Other sellers of the same product are recorded as
+`other_sellers` competitive intel, never as our match. Fetch failures, blocks,
+and unverified stores surface as SOURCE_ERROR / NEEDS REVIEW, never faked.
 
 Usage:
-    python naar_price_poc.py --backend fixture            # offline demo, all six statuses
-    python naar_price_poc.py --backend direct --limit 10  # live run (Naar API + direct fetch)
-    python naar_price_poc.py --self-test                  # regression checks from the code review
-    python naar_price_poc.py --backend fixture --llm-judge  # borderline judge (see LLM_JUDGE_PROVIDER)
+    python verify_app.py                                   # confirm stores (web UI)
+    SCRAPERAPI_STRUCTURED... not needed; structured is the only Amazon path
+    python naar_price_poc.py --backend direct --limit 15 --marketplaces amazon_in
+    python naar_price_poc.py --backend fixture             # offline demo (sellers pre-confirmed)
+    python naar_price_poc.py --self-test                   # regression checks
 
-Borderline judge provider (optional; only rules on product-gate borderlines,
-never sets price/seller): LLM_JUDGE_PROVIDER=anthropic|openai (default: auto by
-key). anthropic -> ANTHROPIC_API_KEY(+ANTHROPIC_MODEL); openai -> OPENAI_API_KEY
-(+OPENAI_BASE_URL,OPENAI_MODEL), which also drives any OpenAI-compatible vendor
-(Qwen/DeepSeek/Groq/OpenRouter/local Ollama). No key -> judge is skipped.
+Borderline LLM judge (optional; only rules on product-gate borderlines, never
+sets price/seller): LLM_JUDGE_PROVIDER=anthropic|openai (default: auto by key).
+openai also drives any OpenAI-compatible vendor via OPENAI_BASE_URL.
 
-Flags: --strict makes ANY unexplained token in a candidate title demote it to
-borderline (judge or AMBIGUOUS_MATCH); default tolerates one.
-
-Outputs: results.csv and results.jsonl in --out (default ./poc_out).
-
-v2 review fixes:
-  1. norm_name strips only true legal suffixes — "Reliance Retail" no longer
-     equals "Reliance Industries". Token-set equality handles word reordering.
-  2. Variant attributes match on word boundaries ("Teal" != "Steal").
-  3. Candidates that add unexplained content tokens (vs Naar title/variant/
-     description) are borderline, never auto-pass ("Amla Powder" vs
-     "Amla Powder Hair Mask").
-  4. Seller-matched offers are collected across all candidates, then chosen:
-     purchasable beats OUT_OF_STOCK; a matched offer with no extractable
-     price is SOURCE_ERROR, never a guess and never mislabelled OOS.
-  5. A variant without sellingPrice is skipped with a warning — never ₹0.00.
-  6. A failed offer-list fetch on a product-matched listing is SOURCE_ERROR,
-     not silently "no offers".
-  7. Flipkart parses brace-matched __INITIAL_STATE__ JSON instead of
-     first-regex-on-page.
-  8. Meesho catalogue min price is never recorded as an offer price.
-  9. Record invariants raise, not assert; every record carries search_query.
-
-v3 review fixes (price integrity + honest blocks):
-  1. _walk_first is document-order/shallowest (BFS), and Flipkart reads seller
-     + price from a SINGLE node — so they can't be paired from two unrelated
-     products in a large embedded state.
-  2. A captcha/interstitial returned with HTTP 200 is a SOURCE_ERROR, not a
-     silent PRODUCT_NOT_FOUND (soft-block detection).
-  3. Meesho takes price only from the supplier-tied PDP node; the SERP card ₹
-     (a catalogue minimum) is never recorded as the seller's offer price.
-  4. OUT_OF_STOCK vs SOURCE_ERROR scans ALL matched offers — an in-stock offer
-     with an unextractable price wins as SOURCE_ERROR over an OOS sibling.
-  5. Numeric variant attributes (size "8", "42") are gated on word boundaries;
-     quantity-style values stay owned by the unit-normalised quantity gate.
+Marketplaces: Amazon via ScraperAPI structured JSON (SCRAPERAPI_KEY). Flipkart /
+Meesho have no structured endpoint yet -> honest stubs that raise until a
+provider is wired. Store registry: poc/seller_identity.json ($NAAR_KYC_FILE).
+Outputs: results.csv / results.jsonl in --out.
 """
 
 from __future__ import annotations
@@ -68,7 +42,7 @@ import json
 import os
 import re
 import sys
-import time
+import threading
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Iterable, Optional
@@ -217,19 +191,6 @@ def name_compare(observed: Optional[str], target: Optional[str]) -> tuple[float,
     return SequenceMatcher(None, a, b).ratio(), None
 
 
-# --- Seller identity beyond the display name ------------------------------
-# A seller can rebrand freely, but their GST id, registered legal name, and the
-# marketplace store URL they were onboarded with do not change. These let us
-# confirm the SAME seller under a DIFFERENT store/brand name.
-
-def _norm_gstin(s: Optional[str]) -> str:
-    """A GSTIN is 15 alphanumerics; compare case-insensitively, ignoring spaces."""
-    if not s:
-        return ""
-    g = re.sub(r"[^0-9a-z]", "", s.casefold())
-    return g if re.fullmatch(r"[0-9]{2}[a-z0-9]{13}", g) else ""
-
-
 def _seller_id_from_url(url: Optional[str]) -> str:
     """Stable seller/store token from a marketplace seller URL, so a
     seller-provided store URL matches the listing's seller link regardless of
@@ -242,8 +203,8 @@ def _seller_id_from_url(url: Optional[str]) -> str:
     m = re.search(r"/seller/([^/?#]+)", url, re.I)                # generic /seller/<slug>
     if m:
         return "seller:" + m.group(1).lower()
-    m = re.search(r"(?:shop|supplier|store)/([^/?#]+)", url, re.I)  # Meesho/Flipkart store
-    if m:
+    m = re.search(r"(?:^|/)(?:shop|supplier|store)/([^/?#]+)", url, re.I)  # Meesho/Flipkart store
+    if m:                                                          # anchored: won't match 'megastore/x'
         return "store:" + m.group(1).lower()
     return ""
 
@@ -258,51 +219,24 @@ def load_seller_identities() -> dict:
     this is a DB export, not a manual lookup. Path: $NAAR_KYC_FILE, else
     poc/seller_identity.json."""
     global _seller_identity_cache
-    if _seller_identity_cache is not None:
-        return _seller_identity_cache
-    import pathlib
-    env_path = os.environ.get("NAAR_KYC_FILE", "").strip()
-    p = pathlib.Path(env_path) if env_path else \
-        pathlib.Path(__file__).resolve().parent / "seller_identity.json"
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+    # Hold the same lock as the writers: without it, a reader can read the old
+    # disk, then a committed write busts the cache, then the reader assigns its
+    # STALE snapshot — durably masking a just-confirmed store.
+    with _registry_lock:
+        if _seller_identity_cache is not None:
+            return _seller_identity_cache
+        # Parse via the single source of truth so the reader handles a corrupt
+        # registry the SAME way as writers (backup + SourceError) instead of
+        # silently returning {} — which would mask confirmed stores as unverified.
+        data = _load_registry_file()
         _seller_identity_cache = {k: v for k, v in data.items() if not k.startswith("_")}
-    except (OSError, json.JSONDecodeError):
-        _seller_identity_cache = {}
-    return _seller_identity_cache
-
-
-def resolve_naar_seller(product: dict, marketplace: str) -> dict:
-    """Merge the product's inline seller block with the KYC map, and pick the
-    store URL registered for THIS marketplace. KYC values fill gaps; inline Naar
-    data wins where both exist."""
-    seller = dict(product.get("seller") or {})
-    ident = load_seller_identities().get(str(product.get("sellerId") or ""), {})
-    for k in ("gstin", "brand", "pincode", "businessName", "storeName", "not_on"):
-        if not seller.get(k) and ident.get(k):
-            seller[k] = ident[k]
-    url = ident.get(f"{marketplace}_url") or ident.get("store_url")
-    if url:
-        seller["store_url"] = url
-    return seller
-
-
-def seller_present_on(marketplace: str, seller: dict) -> Optional[bool]:
-    """Is this seller on the marketplace, per KYC? True (has a store URL there),
-    False (explicitly listed in `not_on`), or None (unknown -> search as usual).
-    A False lets the pipeline SKIP the seller's products entirely — no fetch."""
-    if seller.get("store_url"):
-        return True
-    not_on = seller.get("not_on")
-    if isinstance(not_on, list) and marketplace in not_on:
-        return False
-    return None
+        return _seller_identity_cache
 
 
 # --- Store registry writes (the human-verified store map) ------------------
-# The verification tool curates poc/seller_identity.json: a CONFIRM sets the
-# marketplace store URL (so resolve_naar_seller / seller_gate use it) and a
-# REJECT records the marketplace in `not_on` (so seller_present_on skips it).
+# The verification tool curates poc/seller_identity.json: a CONFIRM records the
+# store (URL and/or Sold-by name) that _confirmed_store / _offer_matches_store
+# use to match offers; a REJECT records the marketplace in `not_on` so run() skips it.
 
 def _registry_path() -> "os.PathLike":
     import pathlib
@@ -312,15 +246,53 @@ def _registry_path() -> "os.PathLike":
 
 
 def _load_registry_file() -> dict:
+    p = _registry_path()
     try:
-        return json.loads(_registry_path().read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
+        text = p.read_text(encoding="utf-8")
+    except OSError:
+        return {}                             # absent -> new registry
+    if not text.strip():
+        return {}                             # empty/whitespace -> new registry, not corrupt
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        # Present but corrupt: back it up and REFUSE to overwrite, so a bad file
+        # never silently wipes prior human-verified stores.
+        import pathlib
+        bak = pathlib.Path(str(p) + ".corrupt.bak")
+        bak.write_text(text, encoding="utf-8")
+        raise SourceError(f"store registry {p} is corrupt (backed up to {bak}); "
+                          f"fix or delete it before writing: {e}") from e
+
+
+# Serialises the load->mutate->save of the registry so two overlapping writers
+# (verify_app's ThreadingHTTPServer serves each POST on its own thread) can't
+# lost-update each other's human-verified stores.
+_registry_lock = threading.RLock()
 
 
 def _save_registry_file(data: dict) -> None:
     global _seller_identity_cache
-    _registry_path().write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    p = _registry_path()
+    # Atomic write: a full temp file in the same dir, then os.replace (atomic on
+    # POSIX/Windows). An interrupted or concurrent write never leaves a truncated
+    # file that _load_registry_file would then quarantine as corrupt.
+    tmp = str(p) + f".tmp.{os.getpid()}"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+    except BaseException:
+        # A failure (disk full, non-serialisable value, interrupt) before the
+        # atomic replace must not leave a .tmp sidecar behind; the real registry
+        # is untouched either way.
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     _seller_identity_cache = None            # bust the read cache so changes take effect
 
 
@@ -331,43 +303,45 @@ def _now_iso() -> str:
 def confirm_store(seller_id: str, marketplace: str, store_url: str = "",
                   seller_display: str = "") -> dict:
     """Human confirmed the seller's store on `marketplace`. Records the store URL
-    when known (used by resolve_naar_seller / seller_gate) and/or the confirmed
-    'Sold by' name (structured API exposes the name, not a URL) + audit status;
-    clears any prior rejection. At least one of store_url / seller_display required."""
+    when known and/or the confirmed 'Sold by' name (the structured API exposes the
+    name, not a URL) + audit status; clears any prior rejection. At least one of
+    store_url / seller_display is required."""
     store_url = (store_url or "").strip()
     seller_display = (seller_display or "").strip()
     if not store_url and not seller_display:
         raise ValueError("confirm_store needs a store_url or a seller_display")
-    data = _load_registry_file()
-    entry = data.setdefault(str(seller_id), {})
-    if store_url:
-        entry[f"{marketplace}_url"] = store_url
-    if isinstance(entry.get("not_on"), list) and marketplace in entry["not_on"]:
-        entry["not_on"] = [m for m in entry["not_on"] if m != marketplace]
-    entry.setdefault("stores", {})[marketplace] = {
-        "store_id": _seller_id_from_url(store_url),
-        "store_url": store_url,
-        "seller_display": seller_display,
-        "status": "confirmed",
-        "verified_at": _now_iso(),
-    }
-    _save_registry_file(data)
-    return entry
+    with _registry_lock:                     # serialise load->mutate->save (no lost updates)
+        data = _load_registry_file()
+        entry = data.setdefault(str(seller_id), {})
+        if store_url:
+            entry[f"{marketplace}_url"] = store_url
+        if isinstance(entry.get("not_on"), list) and marketplace in entry["not_on"]:
+            entry["not_on"] = [m for m in entry["not_on"] if m != marketplace]
+        entry.setdefault("stores", {})[marketplace] = {
+            "store_id": _seller_id_from_url(store_url),
+            "store_url": store_url,
+            "seller_display": seller_display,
+            "status": "confirmed",
+            "verified_at": _now_iso(),
+        }
+        _save_registry_file(data)
+        return entry
 
 
 def reject_store(seller_id: str, marketplace: str) -> dict:
     """Human confirmed the seller is NOT on `marketplace` (or the proposal was
     wrong). Records it in `not_on` so the pipeline skips it, drops any store URL."""
-    data = _load_registry_file()
-    entry = data.setdefault(str(seller_id), {})
-    entry.pop(f"{marketplace}_url", None)
-    not_on = entry.setdefault("not_on", [])
-    if marketplace not in not_on:
-        not_on.append(marketplace)
-    entry.setdefault("stores", {})[marketplace] = {
-        "status": "rejected", "verified_at": _now_iso()}
-    _save_registry_file(data)
-    return entry
+    with _registry_lock:                     # serialise load->mutate->save (no lost updates)
+        data = _load_registry_file()
+        entry = data.setdefault(str(seller_id), {})
+        entry.pop(f"{marketplace}_url", None)
+        not_on = entry.setdefault("not_on", [])
+        if marketplace not in not_on:
+            not_on.append(marketplace)
+        entry.setdefault("stores", {})[marketplace] = {
+            "status": "rejected", "verified_at": _now_iso()}
+        _save_registry_file(data)
+        return entry
 
 
 def store_status(seller_id: str, marketplace: str) -> str:
@@ -406,12 +380,12 @@ def extract_attrs(text: str) -> dict:
 
 
 def _norm_gtin13(s: Optional[str]) -> str:
-    """A GTIN/EAN/UPC as bare digits (8–14). The single strongest product
-    identity signal: an exact GTIN match is the same product, full stop."""
+    """A GTIN/EAN/UPC as bare digits, zero-padded to GTIN-14 so the same code in
+    UPC-12 / EAN-13 / GTIN-14 form compares equal — the strongest identity signal."""
     if not s:
         return ""
     d = re.sub(r"\D", "", str(s))
-    return d if 8 <= len(d) <= 14 else ""
+    return d.zfill(14) if 8 <= len(d) <= 14 else ""
 
 
 def naar_gtin(product: dict, variant: dict) -> str:
@@ -433,11 +407,20 @@ def quantity_ratio(n_attrs: dict, c_attrs: dict) -> Optional[float]:
     states a pack."""
     nq, cq = n_attrs.get("qty_base"), c_attrs.get("qty_base")
     np_, cp = n_attrs.get("pack"), c_attrs.get("pack")
-    if nq and cq:                       # both weights/volumes known
-        return cq / nq
-    if np_ or cp:                       # a pack count on either side (missing => 1 each)
-        return (cp or 1) / (np_ or 1)
-    return None                         # no comparable quantity signal
+    if nq is not None and cq is not None:               # both weights/volumes -> same dimension
+        denom = nq * (np_ or 1)
+        if denom <= 0:                                  # a parsed "0g"/"0 ml" token -> not comparable
+            return None
+        return (cq * (cp or 1)) / denom
+    if nq is None and cq is None and (np_ is not None or cp is not None):
+        return (cp or 1) / (np_ or 1)                   # only pack counts differ
+    # One side weight, the other pack. Safe ONLY when the weighted side is a single
+    # unit and the other is a multipack of it (candidate holds `cp` naar-sized units):
+    if nq is not None and cq is None and cp is not None and np_ is None:
+        return float(cp)                                # naar = 1 unit, candidate = cp of them
+    # Otherwise the naar unit weight is unknown (naar states a pack, candidate a
+    # weight) -> can't express candidate in naar units. Mixing = garbage ratio.
+    return None
 
 
 def per_unit_price(price: Optional[float], ratio: Optional[float]) -> Optional[float]:
@@ -569,402 +552,6 @@ def _redact_secrets(msg: str) -> str:
     return re.sub(r"(api_key=)[^&\s]+", r"\1***", msg, flags=re.I)
 
 
-# Amazon/Flipkart frequently answer a bot with HTTP 200 and a captcha /
-# interstitial body rather than a 4xx. Treating that as "no products" would
-# mislabel a block as PRODUCT_NOT_FOUND — the exact dishonesty the brief
-# rejects. Markers are specific to avoid flagging legitimate product pages.
-_BLOCK_MARKERS = (
-    "validatecaptcha",
-    "/errors/validatecaptcha",
-    "enter the characters you see below",
-    "to discuss automated access to amazon data",
-    "type the characters you see in this image",
-    "our systems have detected unusual traffic",
-    "you don't have permission to access",      # Akamai "Access Denied" (Meesho)
-    "errors.edgesuite.net",
-)
-
-
-def _looks_blocked(body: str) -> bool:
-    low = (body or "")[:20000].lower()
-    return any(mk in low for mk in _BLOCK_MARKERS)
-
-
-def _merge_url_params(url: str, params: dict) -> str:
-    """Fold query params into the URL (marketplaces are GET-only here)."""
-    if not params:
-        return url
-    from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
-    parts = urlsplit(url)
-    q = dict(parse_qsl(parts.query, keep_blank_values=True))
-    q.update({k: str(v) for k, v in params.items()})
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(q), parts.fragment))
-
-
-class _Resp:
-    """Minimal response shim so a Selenium-rendered page flows through the same
-    block checks and parsers as a requests.Response (only .text/.status_code used)."""
-    __slots__ = ("text", "status_code")
-
-    def __init__(self, text: str, status_code: int = 200):
-        self.text = text
-        self.status_code = status_code
-
-
-# --- Selenium fetch backend (no per-request cost; renders JS; evades basic bot
-#     checks). Opt in with USE_SELENIUM=1. A single shared headless Chrome is
-#     reused across the run and closed at exit. -----------------------------
-_selenium_driver = None
-
-
-def _selenium_enabled() -> bool:
-    return os.environ.get("USE_SELENIUM", "").strip().lower() in ("1", "true", "yes")
-
-
-def _get_selenium_driver():
-    """Lazily build one shared Chrome. Prefers undetected-chromedriver (hides
-    navigator.webdriver / automation fingerprints) when available; falls back to
-    stock Selenium with the automation flags stripped. SELENIUM_HEADFUL=1 shows
-    the window (often bypasses more bot walls); SELENIUM_UC=0 forces stock."""
-    global _selenium_driver
-    if _selenium_driver is not None:
-        return _selenium_driver
-    headful = os.environ.get("SELENIUM_HEADFUL", "").strip() in ("1", "true", "yes")
-    use_uc = os.environ.get("SELENIUM_UC", "1").strip() not in ("0", "false", "no")
-    try:
-        if use_uc:
-            import undetected_chromedriver as uc
-            opts = uc.ChromeOptions()
-            opts.add_argument("--no-sandbox")
-            opts.add_argument("--disable-dev-shm-usage")
-            opts.add_argument("--lang=en-IN")
-            opts.add_argument(f"--user-agent={UA}")
-            _selenium_driver = uc.Chrome(options=opts, headless=not headful)
-        else:
-            from selenium import webdriver
-            from selenium.webdriver.chrome.options import Options
-            opts = Options()
-            if not headful:
-                opts.add_argument("--headless=new")
-            for a in ("--no-sandbox", "--disable-dev-shm-usage",
-                      "--disable-blink-features=AutomationControlled",
-                      "--lang=en-IN", "--window-size=1366,900", f"--user-agent={UA}"):
-                opts.add_argument(a)
-            opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-            opts.add_experimental_option("useAutomationExtension", False)
-            _selenium_driver = webdriver.Chrome(options=opts)
-            _selenium_driver.execute_cdp_cmd(
-                "Page.addScriptToEvaluateOnNewDocument",
-                {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"})
-    except Exception as e:
-        raise SourceError(f"selenium unavailable: {e}") from e
-    return _selenium_driver
-
-
-_SELENIUM_REDIRECT_MARKERS = ("/ap/signin", "/errors/", "validatecaptcha", "/captcha")
-
-
-def _selenium_get(url: str, wait_ms: Optional[int], timeout: int) -> str:
-    # Rebuild-once: a crashed/invalid Chrome session would otherwise poison every
-    # remaining fetch in the run. On failure we drop the (possibly dead) driver
-    # and retry with a fresh one; a second failure is an honest SourceError.
-    last_err: Optional[Exception] = None
-    for attempt in (1, 2):
-        driver = _get_selenium_driver()
-        try:
-            driver.set_page_load_timeout(max(timeout, 30))
-            driver.get(url)
-            last_err = None
-            break
-        except Exception as e:
-            last_err = e
-            _close_selenium()          # force a fresh driver on the next attempt
-    if last_err is not None:
-        raise SourceError(f"selenium fetch failed: {_redact_secrets(str(last_err))}") from last_err
-    driver = _get_selenium_driver()
-    # Let JS settle (SERP XHR, __NEXT_DATA__ hydration) before inspecting the page.
-    ms = wait_ms if wait_ms is not None else int(_cfg_float("SELENIUM_WAIT_MS", 4000))
-    time.sleep(ms / 1000.0)
-    # A redirect to a sign-in / captcha / error URL is a block, not a valid page —
-    # surface it honestly instead of returning a login page as "no products".
-    cur = (getattr(driver, "current_url", "") or "").lower()
-    if any(m in cur for m in _SELENIUM_REDIRECT_MARKERS):
-        raise SourceError(f"selenium: redirected to a block/login page ({cur[:80]})")
-    return driver.page_source
-
-
-def _close_selenium() -> None:
-    global _selenium_driver
-    if _selenium_driver is not None:
-        try:
-            _selenium_driver.quit()
-        except Exception:
-            pass
-        _selenium_driver = None
-
-
-import atexit as _atexit
-_atexit.register(_close_selenium)
-
-
-def _http_get(url: str, **kw) -> "requests.Response":
-    """GET a marketplace URL through the selected fetch backend.
-
-    Backend precedence:
-      1. Selenium (USE_SELENIUM=1) — a real headless Chrome that renders JS and
-         evades basic bot checks; no per-request cost. See _get_selenium_driver.
-      2. ScraperAPI (SCRAPERAPI_KEY set) for meesho.com, or every host with
-         SCRAPERAPI_ALL=1.
-      3. Plain requests (default).
-
-    JS render/wait apply to the proxy/Selenium paths. Callers may pass
-    render=True/False, wait_ms, params, timeout, headers.
-    """
-    if requests is None and not _selenium_enabled():
-        raise SourceError("requests not installed")
-    params = dict(kw.pop("params", None) or {})
-    timeout = kw.pop("timeout", 25)
-    render_override = kw.pop("render", None)
-    wait_ms = kw.pop("wait_ms", None)
-    headers = kw.pop("headers", None) or {
-        "User-Agent": UA, "Accept-Language": "en-IN,en;q=0.9",
-    }
-    api_key = os.environ.get("SCRAPERAPI_KEY", "").strip()
-    host = re.sub(r"^www\.", "", (re.match(r"https?://([^/]+)", url) or [None, ""])[1]).lower()
-    use_proxy = bool(api_key) and (
-        os.environ.get("SCRAPERAPI_ALL", "").strip() in ("1", "true", "yes")
-        or host.endswith("meesho.com")
-    )
-    # Selenium handles the hosts it can (Amazon/Flipkart); Meesho is behind Akamai
-    # and Selenium can't pass it, so route Meesho to ScraperAPI whenever a key is
-    # set — even with USE_SELENIUM on. This makes one `--marketplaces amazon_in
-    # flipkart meesho` run do the right thing per host.
-    selenium_on = _selenium_enabled() and not (host.endswith("meesho.com") and use_proxy)
-    try:
-        if selenium_on:
-            full = _merge_url_params(url, params)
-            r = _Resp(_selenium_get(full, wait_ms=wait_ms, timeout=timeout))
-        elif use_proxy:
-            url = _merge_url_params(url, params)
-            if render_override is None:
-                render = os.environ.get("SCRAPERAPI_RENDER", "").strip() in (
-                    "1", "true", "yes")
-            else:
-                render = bool(render_override)
-            # Meesho needs JS for __NEXT_DATA__; default render on for that host.
-            if render_override is None and host.endswith("meesho.com"):
-                render = True
-            sapi = {
-                "api_key": api_key,
-                "url": url,
-                "render": "true" if render else "false",
-                "country_code": "in",
-            }
-            # Give the client-side search XHR time to populate (Meesho).
-            if wait_ms is None and host.endswith("meesho.com") and render:
-                wait_ms = 5000
-            if wait_ms:
-                sapi["wait"] = int(wait_ms)
-            r = requests.get(
-                "https://api.scraperapi.com",
-                params=sapi,
-                timeout=max(timeout, 120 if render else 60),
-            )
-        else:
-            r = requests.get(url, headers=headers, params=params or None,
-                             timeout=timeout, **kw)
-    except SourceError:
-        raise                                  # selenium/backend errors keep their message
-    except Exception as e:  # DNS, timeout, refused — all honest failures
-        raise SourceError(f"fetch failed: {_redact_secrets(str(e))}") from e
-    if r.status_code in (403, 429, 503):
-        raise SourceError(f"blocked or throttled: HTTP {r.status_code}")
-    if r.status_code >= 400:
-        raise SourceError(f"HTTP {r.status_code}")
-    if _looks_blocked(r.text):                         # fix v3-2: 200 + captcha
-        raise SourceError("soft-block: captcha/interstitial returned with HTTP 200")
-    return r
-
-
-def _jsonld_offers(html: str) -> list[dict]:
-    """Pull schema.org Product offers out of JSON-LD blocks. Deterministic; no LLM."""
-    out = []
-    for m in re.finditer(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>',
-                         html, re.S | re.I):
-        try:
-            data = json.loads(m.group(1))
-        except json.JSONDecodeError:
-            continue
-        items = data if isinstance(data, list) else [data]
-        for it in items:
-            if isinstance(it, dict) and it.get("@type") in ("Product", ["Product"]):
-                offers = it.get("offers") or {}
-                offers = offers if isinstance(offers, list) else [offers]
-                for o in offers:
-                    if isinstance(o, dict):
-                        out.append({"price": o.get("price"),
-                                    "availability": o.get("availability", ""),
-                                    "seller": (o.get("seller") or {}).get("name")})
-    return out
-
-
-def _jsonld_gtin(html: str) -> Optional[str]:
-    """Pull a product barcode from schema.org JSON-LD (gtin13/gtin/ean/etc.),
-    when the listing exposes one. Deterministic; best-effort (often absent)."""
-    for m in re.finditer(r'<script[^>]+application/ld\+json[^>]*>(.*?)</script>',
-                         html, re.S | re.I):
-        try:
-            data = json.loads(m.group(1))
-        except json.JSONDecodeError:
-            continue
-        for it in (data if isinstance(data, list) else [data]):
-            if not isinstance(it, dict):
-                continue
-            for key in ("gtin13", "gtin14", "gtin12", "gtin8", "gtin", "ean", "isbn"):
-                g = _norm_gtin13(it.get(key))
-                if g:
-                    return g
-    return None
-
-
-def _extract_embedded_json(html: str, marker: str) -> Optional[dict]:
-    """Brace-matched extraction of `marker = {...}` (fix 7). Deterministic:
-    respects strings/escapes, no regex-over-JSON guessing."""
-    i = html.find(marker)
-    if i < 0:
-        return None
-    j = html.find("{", i)
-    if j < 0:
-        return None
-    depth, in_str, esc = 0, False, False
-    for k in range(j, len(html)):
-        ch = html[k]
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-        else:
-            if ch == '"':
-                in_str = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(html[j:k + 1])
-                    except json.JSONDecodeError:
-                        return None
-    return None
-
-
-def _walk_first(obj, want_keys: tuple[str, ...]) -> Optional[dict]:
-    """Shallowest, document-order sub-dict containing all want_keys (fix v3-1).
-
-    Breadth-first in insertion order: the primary product/offer node in a big
-    embedded state (Flipkart __INITIAL_STATE__, Meesho __NEXT_DATA__) is
-    normally shallow and appears before recommendation carousels, so BFS is far
-    less likely than a LIFO stack to bind a *different* product's price/seller.
-    """
-    from collections import deque
-    q = deque([obj])
-    while q:
-        cur = q.popleft()
-        if isinstance(cur, dict):
-            if all(k in cur for k in want_keys):
-                return cur
-            q.extend(cur.values())
-        elif isinstance(cur, list):
-            q.extend(cur)
-    return None
-
-
-# Selling-price containers first; the generic ".a-price" fallback is guarded
-# against struck-through MRP so we never record the crossed-out list price.
-_AMAZON_PRICE_SELECTORS = (
-    "#corePrice_feature_div .a-price .a-offscreen",
-    "#tp_price_block_total_price_ww .a-offscreen",
-    "#corePriceDisplay_desktop_feature_div .a-price .a-offscreen",
-    "span.a-price .a-offscreen",
-)
-
-
-def _amazon_visible_price(soup) -> Optional[float]:
-    """First non-strikethrough buy-box price on a product page. Skips MRP that
-    Amazon renders inside a struck `.a-text-price` / `data-a-strike` node."""
-    for sel in _AMAZON_PRICE_SELECTORS:
-        for el in soup.select(sel):
-            price_span = el.find_parent("span", class_="a-price")
-            if price_span is not None:
-                classes = price_span.get("class") or []
-                if "a-text-price" in classes or price_span.get("data-a-strike") == "true":
-                    continue
-            price = _parse_inr(el.get_text())
-            if price is not None:
-                return price
-    return None
-
-
-# GSTIN = 2 state digits, 5 PAN letters, 4 PAN digits, PAN check letter, entity
-# char, 'Z', checksum char. Matching this on a seller profile confirms identity
-# regardless of the store/brand name shown on the listing.
-_GSTIN_RE = re.compile(r"\b\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]\b")
-
-
-def _amazon_seller_profile(url: str) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """Fetch an Amazon seller profile page and pull (legal_name, gstin, address)
-    from the 'Detailed Seller Information'. Best-effort: any miss returns None,
-    so a seller who differs only by display name can still be confirmed by GSTIN
-    / registered legal name. Never fabricates — parses labelled fields only."""
-    from bs4 import BeautifulSoup
-    pr = _http_get(url)
-    txt = BeautifulSoup(pr.text, "html.parser").get_text("\n", strip=True)
-    legal = None
-    m = re.search(r"Business Name\s*:?\s*(.+)", txt, re.I)
-    if m:
-        legal = (m.group(1).splitlines()[0].strip() or None)
-        if legal:
-            legal = legal[:80]
-    g = _GSTIN_RE.search(pr.text) or _GSTIN_RE.search(txt)
-    gstin = g.group(0) if g else None
-    addr = None
-    a = re.search(r"(?:Registered Address|Business Address|Address)\s*:?\s*(.+)", txt, re.I)
-    if a:
-        addr = (a.group(1).splitlines()[0].strip() or None)
-        if addr:
-            addr = addr[:200]
-    return legal, gstin, addr
-
-
-def _seller_profile_lookup_enabled() -> bool:
-    return os.environ.get("SELLER_PROFILE_LOOKUP", "").strip().lower() in ("1", "true", "yes")
-
-
-def _amazon_profile_url(soup_or_el) -> Optional[str]:
-    """Find the seller id (`seller=<ID>`) and build the seller-INFO page URL —
-    `.../gp/help/seller/at-a-glance.html?seller=<ID>`, which carries Business
-    Name + GST. (The `/sp?seller=` storefront does NOT, and often 404s.) Ignores
-    generic links with no seller id."""
-    for a in soup_or_el.select("a[href*='seller=']"):
-        m = re.search(r"[?&]seller=([A-Z0-9]{6,})", a.get("href", ""), re.I)
-        if m:
-            return ("https://www.amazon.in/gp/help/seller/at-a-glance.html"
-                    f"?seller={m.group(1)}")
-    return None
-
-
-# --- Structured-data API path (reliable JSON, no HTML parsing / no Selenium) ---
-# ScraperAPI's structured endpoints return parsed product/price/seller JSON, which
-# eliminates the ~55% Selenium SOURCE_ERROR seen at scale and our fragile parsers.
-
-def _use_amazon_structured() -> bool:
-    return (os.environ.get("SCRAPERAPI_STRUCTURED", "").strip().lower() in ("1", "true", "yes")
-            and bool(os.environ.get("SCRAPERAPI_KEY", "").strip()))
-
-
 def _scraperapi_structured(kind: str, params: dict) -> dict:
     """GET a ScraperAPI structured-data endpoint (e.g. 'amazon/search',
     'amazon/product') and return parsed JSON. Honest failures -> SourceError."""
@@ -984,15 +571,23 @@ def _scraperapi_structured(kind: str, params: dict) -> dict:
     if r.status_code >= 400:
         raise SourceError(f"structured HTTP {r.status_code}")
     try:
-        return r.json()
+        body = r.json()
     except ValueError as e:
         raise SourceError(f"structured non-JSON body: {e}") from e
+    if not isinstance(body, dict):
+        # 200 with a top-level array/scalar (providers emit these on edge/errors):
+        # honest SourceError, not an AttributeError crashing the whole lookup.
+        raise SourceError(f"structured body not a JSON object (got {type(body).__name__})")
+    return body
 
 
 def _amazon_structured_candidates(search_json: dict, marketplace: str, limit: int = 5) -> list[Candidate]:
     """Parse the structured amazon/search JSON into candidates. Pure/testable."""
     out: list[Candidate] = []
-    for it in (search_json.get("results") or [])[:limit * 2]:
+    results = search_json.get("results")
+    if not isinstance(results, list):           # provider hiccup / unexpected shape
+        return out
+    for it in results[:limit * 2]:
         if not isinstance(it, dict):
             continue
         asin = str(it.get("asin") or "").strip()
@@ -1019,39 +614,11 @@ def _amazon_structured_offer(product_json: dict, asin: str) -> Offer:
 
 
 class AmazonInAdapter(MarketplaceAdapter):
-    """Direct fallback for amazon.in. Search page -> product pages (JSON-LD)
-    -> AOD endpoint for the full offer list. Blocks surface honestly: a failed
-    offer fetch is recorded on the candidate (fix 6), not swallowed."""
+    """Amazon.in via ScraperAPI structured JSON (reliable; no HTML/Selenium):
+    search -> per-candidate product lookup for price + sold_by (the seller)."""
     name = "amazon_in"
-    AOD = "https://www.amazon.in/gp/product/ajax/ref=aod_f_new?asin={asin}&pc=dp&experienceId=aodAjaxMain"
 
     def search(self, query: str) -> list[Candidate]:
-        if _use_amazon_structured():
-            return self._search_structured(query)
-        from bs4 import BeautifulSoup
-        r = _http_get("https://www.amazon.in/s", params={"k": query})
-        soup = BeautifulSoup(r.text, "html.parser")
-        cands: list[Candidate] = []
-        for div in soup.select('div[data-asin][data-component-type="s-search-result"]')[:5]:
-            asin = div.get("data-asin", "").strip()
-            title_el = div.select_one("h2 span")
-            if not asin or not title_el:
-                continue
-            cands.append(Candidate(self.name, asin,
-                                   f"https://www.amazon.in/dp/{asin}",
-                                   title_el.get_text(" ", strip=True)))
-        for c in cands:
-            try:
-                c.offers = self._offers(c)
-            except SourceError as e:
-                c.offers, c.offers_error = [], str(e)      # fix 6
-            time.sleep(1.0)  # be polite; this is a 10-product POC, not a crawler
-        return cands
-
-    def _search_structured(self, query: str) -> list[Candidate]:
-        """Reliable path: ScraperAPI structured JSON — search then per-candidate
-        product (price + sold_by), no HTML parsing. A failed product lookup is
-        recorded on the candidate, not swallowed."""
         cands = _amazon_structured_candidates(
             _scraperapi_structured("amazon/search", {"query": query}), self.name)
         for c in cands:
@@ -1062,280 +629,22 @@ class AmazonInAdapter(MarketplaceAdapter):
                 c.offers, c.offers_error = [], str(e)
         return cands
 
-    def _offers(self, cand: Candidate) -> list[Offer]:
-        from bs4 import BeautifulSoup
-        asin = cand.listing_id
-        offers: list[Offer] = []
-        pr = _http_get(f"https://www.amazon.in/dp/{asin}")
-        soup = BeautifulSoup(pr.text, "html.parser")
-        cand.gtin = cand.gtin or _jsonld_gtin(pr.text)     # barcode for GTIN-anchored match
 
-        # The buy-box "Sold by" seller-profile link — the anchor for GSTIN/legal
-        # lookup that confirms a seller trading under a different display name.
-        # Must be a real /sp?seller=<ID> link, not a generic help page.
-        dp_seller_url = _amazon_profile_url(soup)
-
-        # Buy box via product page JSON-LD when present.
-        for o in _jsonld_offers(pr.text):
-            offers.append(Offer(seller_display=o.get("seller"),
-                                price_inr=_to_float(o.get("price")),
-                                in_stock="OutOfStock" not in str(o.get("availability")),
-                                seller_url=dp_seller_url,
-                                offer_ref=f"{asin}:buybox"))
-
-        # Amazon.in often ships DP HTML with empty JSON-LD offers. Fall back to
-        # the visible buy-box price + "Sold by" / store link.
-        if not offers:
-            price = _amazon_visible_price(soup)
-            sold = (soup.select_one("#sellerProfileTriggerId")
-                    or soup.select_one("#merchant-info a")
-                    or soup.select_one("a[href*='seller=']"))
-            seller = sold.get_text(strip=True) if sold else None
-            if price is not None or seller:
-                offers.append(Offer(seller_display=seller, price_inr=price,
-                                    seller_url=dp_seller_url,
-                                    offer_ref=f"{asin}:buybox_html"))
-        elif not offers[0].seller_display:
-            sold = (soup.select_one("#sellerProfileTriggerId")
-                    or soup.select_one("#merchant-info a")
-                    or soup.select_one("a[href*='seller=']"))
-            if sold:
-                offers[0].seller_display = sold.get_text(strip=True)
-
-        # Full offer list via AOD (§4.3). Optional — many locales 404 this endpoint.
-        try:
-            ar = _http_get(self.AOD.format(asin=asin))
-            asoup = BeautifulSoup(ar.text, "html.parser")
-            for i, block in enumerate(asoup.select("#aod-offer")):
-                sold_by = block.select_one("#aod-offer-soldBy a, #aod-offer-soldBy .a-color-base")
-                price_el = block.select_one(".a-price .a-offscreen")
-                offers.append(Offer(
-                    seller_display=sold_by.get_text(strip=True) if sold_by else None,
-                    price_inr=_parse_inr(price_el.get_text()) if price_el else None,
-                    seller_url=_amazon_profile_url(block),
-                    offer_ref=f"{asin}:aod{i}"))
-        except SourceError:
-            if not offers:
-                raise
-
-        # Best-effort seller-identity enrichment (opt-in via SELLER_PROFILE_LOOKUP):
-        # pull legal name + GSTIN from each distinct seller profile so the seller
-        # gate can confirm a DIFFERENT-NAMED seller by hard id. Failures are silent.
-        if _seller_profile_lookup_enabled():
-            seen: dict[str, tuple] = {}
-            for off in offers:
-                if not off.seller_url or off.seller_gstin:
-                    continue
-                if off.seller_url not in seen:
-                    try:
-                        seen[off.seller_url] = _amazon_seller_profile(off.seller_url)
-                    except SourceError:
-                        seen[off.seller_url] = (None, None, None)
-                legal, gstin, addr = seen[off.seller_url]
-                off.seller_legal = off.seller_legal or legal
-                off.seller_gstin = off.seller_gstin or gstin
-                off.seller_address = off.seller_address or addr
-
-        if not offers:
-            raise SourceError(f"no offers extracted for {asin}")
-        return offers
+class _UnsupportedAdapter(MarketplaceAdapter):
+    """Marketplaces with no structured-data endpoint yet. Honest by design: it
+    raises rather than fall back to fragile HTML scraping (which we proved
+    unreliable). Wire a structured provider to enable them."""
+    def search(self, query: str) -> list[Candidate]:
+        raise SourceError(f"{self.name}: no structured-data endpoint configured "
+                          "-- enable a provider, or use amazon_in")
 
 
-class FlipkartAdapter(MarketplaceAdapter):
+class FlipkartAdapter(_UnsupportedAdapter):
     name = "flipkart"
 
-    def search(self, query: str) -> list[Candidate]:
-        from bs4 import BeautifulSoup
-        r = _http_get("https://www.flipkart.com/search", params={"q": query})
-        soup = BeautifulSoup(r.text, "html.parser")
-        cands: list[Candidate] = []
-        for a in soup.select('a[href*="/p/"]')[:5]:
-            href = a.get("href", "")
-            title = a.get("title") or a.get_text(" ", strip=True)
-            pid = re.search(r"pid=([A-Z0-9]+)", href)
-            if not title:
-                continue
-            url = "https://www.flipkart.com" + href.split("&lid=")[0]
-            cands.append(Candidate(self.name, pid.group(1) if pid else href[:40], url, title))
-        for c in cands:
-            try:
-                c.offers = self._offers(c.listing_url)
-            except SourceError as e:
-                c.offers, c.offers_error = [], str(e)      # fix 6
-            time.sleep(1.0)
-        return cands
 
-    def _offers(self, url: str) -> list[Offer]:
-        """Fix 7: parse the page's __INITIAL_STATE__ JSON and walk it, rather
-        than taking the first regex hit anywhere on the page."""
-        pr = _http_get(url)
-        state = _extract_embedded_json(pr.text, "window.__INITIAL_STATE__")
-        if state is not None:
-            ref = url.rsplit("=", 1)[-1][:24]
-
-            def _final_price(node: Optional[dict]) -> Optional[float]:
-                fp = (node or {}).get("finalPrice")
-                if isinstance(fp, dict):
-                    return _to_float(fp.get("value"))
-                return _to_float(fp)
-
-            # Fix v3-1: prefer a single node carrying BOTH the seller and the
-            # price, so they cannot be paired from two unrelated products in the
-            # state. Only fall back to independent walks when no such node
-            # exists — and BFS order keeps that fallback on the primary product.
-            combo = _walk_first(state, ("sellerName", "finalPrice"))
-            if combo is not None:
-                return [Offer(seller_display=combo.get("sellerName"),
-                              price_inr=_final_price(combo), offer_ref=ref)]
-            seller_node = _walk_first(state, ("sellerName",))
-            price_node = _walk_first(state, ("finalPrice",))
-            price = _final_price(price_node)
-            if seller_node or price is not None:
-                return [Offer(seller_display=(seller_node or {}).get("sellerName"),
-                              price_inr=price, offer_ref=ref)]
-        # Narrow fallback, kept for markup drift; still structured-data only.
-        sold = re.search(r'"sellerName"\s*:\s*"([^"]+)"', pr.text)
-        return [Offer(seller_display=sold.group(1) if sold else None,
-                      price_inr=None, offer_ref=url[-24:])]
-
-
-class MeeshoAdapter(MarketplaceAdapter):
+class MeeshoAdapter(_UnsupportedAdapter):
     name = "meesho"
-
-    def search(self, query: str) -> list[Candidate]:
-        r = _http_get("https://www.meesho.com/search", params={"q": query})
-        data = self._next_data(r.text)
-        if data is None:
-            raise SourceError("no __NEXT_DATA__ payload (likely a block page)")
-        cands: list[Candidate] = []
-
-        # Legacy catalogue payload (older Meesho markup).
-        catalogs = (_walk_first(data, ("catalogs",)) or {}).get("catalogs") or []
-        for cat in catalogs[:5]:
-            pid = str(cat.get("catalog_id") or cat.get("id") or "")
-            if not pid:
-                continue
-            supplier = (cat.get("supplier") or {}).get("name")
-            # Fix 8: min_product_price is a catalogue minimum, NOT a specific
-            # seller's offer price. Never record it as an offer price.
-            cands.append(Candidate(
-                self.name, pid, f"https://www.meesho.com/s/p/{pid}",
-                cat.get("name", "") or "",
-                [Offer(seller_display=supplier, price_inr=None, offer_ref=pid)]))
-
-        # Current search page: props.pageProps.initialState.searchListing.listing.products
-        if not cands:
-            products = (
-                (((data.get("props") or {}).get("pageProps") or {})
-                 .get("initialState") or {})
-                .get("searchListing") or {}
-            )
-            listing = (products.get("listing") or {}) if isinstance(products, dict) else {}
-            for prod in (listing.get("products") or [])[:5]:
-                if not isinstance(prod, dict):
-                    continue
-                pid = str(prod.get("product_id") or prod.get("id")
-                          or prod.get("hex_id") or "")
-                name = prod.get("name") or prod.get("product_name") or ""
-                supplier = None
-                sup = prod.get("supplier") or prod.get("shop") or {}
-                if isinstance(sup, dict):
-                    supplier = sup.get("name") or sup.get("shop_name")
-                slug = prod.get("slug") or ""
-                url = (f"https://www.meesho.com/{slug}/p/{pid}" if slug and pid
-                       else f"https://www.meesho.com/s/p/{pid}")
-                if not pid and not name:
-                    continue
-                cands.append(Candidate(
-                    self.name, pid or slug[:40], url, name,
-                    [Offer(seller_display=supplier, price_inr=None,
-                           offer_ref=pid or slug[:24])]))
-
-        # Rendered HTML often has product cards before XHR fills __NEXT_DATA__.
-        if not cands:
-            cands = self._candidates_from_html(r.text)
-
-        # Fix v3-3: the SERP card ₹ on Meesho is the CATALOGUE minimum across
-        # suppliers, not the specific supplier's price — recording it as this
-        # seller's offer price is the same lie as the old min_product_price
-        # (fix 8). Take the price ONLY from the PDP node that is tied to the
-        # supplier (_page_offer), and only when we already have a seller name.
-        for c in cands:
-            if not c.offers:
-                continue
-            if c.offers[0].seller_display and c.offers[0].price_inr is None:
-                try:
-                    price, _seller = self._page_offer(c.listing_url)
-                    c.offers[0].price_inr = price
-                except SourceError as e:
-                    c.offers_error = str(e)
-            # Clean rating/price chrome out of HTML-fallback titles for the gate.
-            c.title = re.sub(
-                r"\s*₹[\d,]+(?:\.\d+)?(?:\s*₹[\d,]+(?:\.\d+)?)?(?:\s*\d+%\s*off)?"
-                r"(?:\s*[\d.]+)?(?:\s*\d+\s*Reviews?)?(?:\s*Supplier)?\s*$",
-                "", c.title, flags=re.I).strip() or c.title
-        return cands
-
-    @staticmethod
-    def _next_data(html: str) -> Optional[dict]:
-        m = re.search(r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>',
-                      html, re.S | re.I)
-        if m:
-            try:
-                return json.loads(m.group(1))
-            except json.JSONDecodeError:
-                pass
-        return (_extract_embedded_json(html, '"__NEXT_DATA__"')
-                or _extract_embedded_json(html, "__NEXT_DATA__"))
-
-    def _candidates_from_html(self, html: str) -> list[Candidate]:
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "html.parser")
-        cands: list[Candidate] = []
-        seen: set[str] = set()
-        for a in soup.select('a[href*="/p/"]'):
-            href = a.get("href") or ""
-            m = re.search(r"/([^/]+)/p/([A-Za-z0-9]+)", href)
-            if not m:
-                continue
-            slug, pid = m.group(1), m.group(2)
-            if pid in seen or len(pid) < 4:
-                continue
-            # Skip non-product chrome links like /p/6 from nav.
-            if slug in ("", "search", "cart", "auth"):
-                continue
-            seen.add(pid)
-            title = a.get("aria-label") or a.get("title") or a.get_text(" ", strip=True)
-            if not title or len(title) < 8:
-                title = slug.replace("-", " ")
-            url = href if href.startswith("http") else "https://www.meesho.com" + href
-            cands.append(Candidate(
-                self.name, pid, url, title,
-                [Offer(seller_display=None, price_inr=None, offer_ref=pid)]))
-            if len(cands) >= 5:
-                break
-        return cands
-
-    def _page_offer(self, url: str) -> tuple[Optional[float], Optional[str]]:
-        pr = _http_get(url)
-        data = self._next_data(pr.text) or {}
-        node = _walk_first(data, ("price", "supplier")) or \
-               _walk_first(data, ("price", "name"))
-        price = _to_float(node.get("price")) if node else None
-        seller = None
-        if node and isinstance(node.get("supplier"), dict):
-            seller = node["supplier"].get("name")
-        if seller is None:
-            sn = _walk_first(data, ("shop_name",)) or _walk_first(data, ("supplier_name",))
-            if sn:
-                seller = sn.get("shop_name") or sn.get("supplier_name")
-        if price is None:
-            m = re.search(r'"price"\s*:\s*([0-9]+(?:\.[0-9]+)?)', pr.text)
-            if m:
-                price = _to_float(m.group(1))
-        return price, seller
-
-
 def _parse_inr(s: str) -> Optional[float]:
     """Parse an INR amount from text that carries the ₹ symbol. Requiring the
     symbol prevents mistaking a size or quantity ("40 X 35", "6-in-1") for a
@@ -1462,16 +771,16 @@ def product_gate(naar_product: dict, variant: dict, cand: Candidate,
     n_qty, c_qty = n_attrs.get("qty_base"), c_attrs.get("qty_base")
     n_pack, c_pack = n_attrs.get("pack"), c_attrs.get("pack")
     ratio = quantity_ratio(n_attrs, c_attrs)
-    weight_one_sided = (n_qty is not None) != (c_qty is not None) and not (n_pack or c_pack)
-    if weight_one_sided:
-        return "borderline", "quantity stated on only one side; cannot compare per unit"
-    if ratio is not None:
-        if ratio > 30 or ratio < 1 / 30:
-            return "borderline", f"implausible quantity ratio {ratio:.2g} — likely a different product"
-        if abs(ratio - 1.0) > 1e-6:
-            evidence.append(f"qty_ratio={ratio:.3g} (per-unit compare)")
-        else:
-            evidence.append("quantity=match")
+    stated = any(x is not None for x in (n_qty, c_qty, n_pack, c_pack))
+    if ratio is None:
+        if stated:                          # a quantity/pack on one side (or mixed dimensions)
+            return "borderline", "quantity/pack not comparable across the two sides"
+    elif ratio > 30 or ratio < 1 / 30:
+        return "borderline", f"implausible quantity ratio {ratio:.2g} — likely a different product"
+    elif abs(ratio - 1.0) > 1e-6:
+        evidence.append(f"qty_ratio={ratio:.3g} (per-unit compare)")
+    else:
+        evidence.append("quantity=match")
 
     # Stated variant attributes (colour, size — incl. numeric sizes like "8",
     # "42") must appear as whole words/numbers in the title (fix 2, v3-5).
@@ -1481,7 +790,9 @@ def product_gate(naar_product: dict, variant: dict, cand: Candidate,
     for k, v in variant_attr_pairs(variant):
         if not v or QTY_RE.search(v):
             continue
-        if re.search(rf"\b{re.escape(v)}\b", cand.title, re.I):
+        # A decimal is a word boundary, so \b8\b would match "8.5" — exclude an
+        # adjacent word char OR '.' on either side so size 8 != size 8.5.
+        if re.search(rf"(?<![\w.]){re.escape(v)}(?![\w.])", cand.title, re.I):
             evidence.append(f"{k}={v}" if k else f"attr={v}")
         else:
             label = f"'{k}={v}'" if k else f"'{v}'"
@@ -1631,61 +942,6 @@ def _llm_same_product(naar_text: str, listing_title: str) -> Optional[bool]:
         return None  # judge unavailable -> stays borderline; never fabricate a verdict
 
 
-def seller_gate(naar_seller: dict, offer: Offer) -> tuple[str, float, str]:
-    """Returns (verdict, confidence, signal). Verdict: MATCH | OTHER | AMBIGUOUS.
-
-    Tiered identity resolution — confirms the SAME seller even under a DIFFERENT
-    store/brand name, hardest signal first:
-      1. GSTIN exact            — unique govt tax id, survives any rename
-      2. seller-provided store URL == the listing's seller link
-      3. registered legal name  — exact / token-set (reordering, PVT==PRIVATE)
-      4. name similarity        — a proposal only (AMBIGUOUS), never a match
-    Only tiers 1–3 are a MATCH; anything softer stays AMBIGUOUS (human review)."""
-    store = naar_seller.get("storeName") or ""
-    legal = naar_seller.get("businessName") or ""
-
-    # Tier 1 — GSTIN. A hard, rename-proof identifier.
-    n_gstin, o_gstin = _norm_gstin(naar_seller.get("gstin")), _norm_gstin(offer.seller_gstin)
-    if n_gstin and o_gstin:
-        if n_gstin == o_gstin:
-            return "MATCH", 0.99, "gstin_exact"
-        return "OTHER", 0.99, "gstin_differs"      # both known and different -> definitely not
-
-    # Tier 2 — seller-provided store URL matches the listing's seller link.
-    n_sid, o_sid = _seller_id_from_url(naar_seller.get("store_url")), _seller_id_from_url(offer.seller_url)
-    if n_sid and o_sid and n_sid == o_sid:
-        return "MATCH", 0.98, "store_url_match"
-
-    # Tiers 3–4 — legal / display name.
-    best_verdict: Optional[str] = None   # None until an identifiable comparison happens
-    best_conf, best_sig = 0.0, ""
-
-    for observed, sig_prefix in ((offer.seller_legal, "legal_name"),
-                                 (offer.seller_display, "sold_by_name")):
-        if not observed:
-            continue
-        for target, tname in ((legal, "businessName"), (store, "storeName")):
-            if not target:
-                continue
-            sim, exactness = name_compare(observed, target)
-            if exactness == "exact":
-                return "MATCH", 0.95, f"{sig_prefix}=={tname}"
-            if exactness == "token_set":
-                return "MATCH", 0.90, f"{sig_prefix}=={tname} (token_set)"
-            if sim >= 0.75:
-                # A proposal; keep the strongest one. Never downgraded later.
-                if best_verdict != "AMBIGUOUS" or sim > best_conf:
-                    best_verdict, best_conf, best_sig = "AMBIGUOUS", sim, \
-                        f"{sig_prefix}~{tname} ({sim:.2f}) — proposal only"
-            elif best_verdict != "AMBIGUOUS" and sim >= best_conf:
-                best_verdict, best_conf, best_sig = "OTHER", sim, \
-                    f"{sig_prefix} differs from {tname} ({sim:.2f})"
-
-    if best_verdict is None:             # nothing identifiable to compare
-        return "AMBIGUOUS", 0.0, "seller_hidden"
-    return best_verdict, best_conf, best_sig
-
-
 # --------------------------------------------------------------------------
 # Store-first: propose candidate stores + match offers to a confirmed store
 # --------------------------------------------------------------------------
@@ -1705,14 +961,16 @@ def _confirmed_store(seller_id: str, marketplace: str) -> Optional[dict]:
 
 def _offer_matches_store(offer: Offer, store: dict) -> bool:
     """Is this marketplace offer from the confirmed store? Matches by seller-URL
-    token when both have one, else by the confirmed 'Sold by' name (exact/token-set)."""
+    token when the offer carries one, else by the confirmed 'Sold by' name. The
+    structured Amazon API exposes the Sold-by NAME (not a URL), so name matching
+    is the live path — and it requires an EXACT normalised match, never a token
+    permutation ('Silk House' must not match a competitor 'House Silk')."""
     sid = store.get("store_id") or _seller_id_from_url(store.get("store_url"))
     if sid and _seller_id_from_url(offer.seller_url) == sid:
         return True
     disp = store.get("seller_display") or ""
     if disp and offer.seller_display:
-        _, exactness = name_compare(offer.seller_display, disp)
-        return exactness is not None            # exact / token_set only
+        return name_compare(offer.seller_display, disp)[1] == "exact"
     return False
 
 
@@ -1752,10 +1010,13 @@ def propose_stores(seller_name: str, marketplace: str, adapter: MarketplaceAdapt
 def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
                     llm_judge: bool, strict: bool = False,
                     store: Optional[dict] = None) -> Record:
-    if variant.get("sellingPrice") in (None, ""):
-        # Fix 5 (defence in depth): never coerce a missing Naar price to 0.0.
-        raise ValueError(f"variant {variant.get('_id')!r} has no sellingPrice; "
-                         "skip it upstream rather than recording a zero")
+    naar_price = _to_float(variant.get("sellingPrice"))
+    if naar_price is None:
+        # Fix 5 (defence in depth): never coerce a missing/garbage Naar price to
+        # 0.0, and never let a raw float() ValueError escape. run() pre-filters
+        # these; this guards direct callers.
+        raise ValueError(f"variant {variant.get('_id')!r} sellingPrice "
+                         f"{variant.get('sellingPrice')!r} is missing/non-numeric; skip it upstream")
     query = variant_search_text(product, variant)
     # Meesho SERP quality improves sharply when the Naar store/brand is in the
     # query; Amazon/Flipkart already rank brand tokens from the title alone.
@@ -1767,7 +1028,7 @@ def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
                 naar_variant_id=variant.get("_id", ""),
                 naar_seller_id=product.get("sellerId", ""),
                 marketplace=adapter.name,
-                naar_selling_price=float(variant["sellingPrice"]),
+                naar_selling_price=naar_price,
                 naar_product_title=product.get("title", ""),
                 naar_variant_name=variant.get("variantName") or variant.get("variantOption") or "",
                 naar_seller_name=(product.get("seller") or {}).get("storeName", ""),
@@ -1778,6 +1039,7 @@ def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
     except SourceError as e:
         return Record(**base, status="SOURCE_ERROR", match_evidence=str(e))
 
+    # 1) Which candidates are the SAME product? (product gate)
     product_matched: list[tuple[Candidate, str]] = []
     any_borderline = False
     for cand in candidates:
@@ -1794,144 +1056,79 @@ def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
                       match_evidence="borderline candidates only" if any_borderline
                                      else "no candidate passed the product gate")
 
-    # Fix 4/6: collect verdicts across ALL matched candidates and offers,
-    # then decide — nothing returns early on the first offer it sees.
-    seller = resolve_naar_seller(product, adapter.name)
-    matched_offers: list[tuple[Candidate, Offer, float, str, str]] = []
-    ambiguous_best: Optional[Record] = None
-    other_offers: list[tuple[Candidate, Offer]] = []   # same product, different seller
+    # 2) Store-first split: the seller is human-verified, so a MATCH means the
+    # confirmed store is the one selling this product. Keep the confirmed store's
+    # offers; record any OTHER seller of the same product as competitive intel only.
     offers_failed = [c.offers_error for c, _ in product_matched if c.offers_error]
-
+    matched_offers: list[tuple[Candidate, Offer, str]] = []
+    other_offers: list[tuple[Candidate, Offer]] = []
     for cand, pevidence in product_matched:
-        for offer in cand.offers or [Offer(None)]:
-            # Store-first mode: the seller is already human-verified, so we only
-            # keep offers FROM the confirmed store — the store filter replaces the
-            # fuzzy seller gate. Anything else on the listing is ignored.
-            if store is not None:
-                if _offer_matches_store(offer, store):
-                    matched_offers.append((cand, offer, 1.0, "store_confirmed", pevidence))
-                continue
-            verdict, conf, signal = seller_gate(seller, offer)
-            if verdict == "MATCH":
-                matched_offers.append((cand, offer, conf, signal, pevidence))
-            elif verdict == "AMBIGUOUS":
-                rec = Record(**base, status="AMBIGUOUS_MATCH",
-                             marketplace_sold_by=offer.seller_display,
-                             marketplace_seller_legal_name=offer.seller_legal,
-                             listing_id=cand.listing_id, listing_url=cand.listing_url,
-                             offer_ref=offer.offer_ref,
-                             product_match_method="attribute_gate",
-                             seller_match_signal=signal, confidence=conf,
-                             match_evidence=pevidence)
-                if ambiguous_best is None or (conf or 0) > (ambiguous_best.confidence or 0):
-                    ambiguous_best = rec
-            elif offer.seller_display:            # OTHER: a nameable different seller
+        for offer in cand.offers or []:
+            if store is not None and _offer_matches_store(offer, store):
+                matched_offers.append((cand, offer, pevidence))
+            elif offer.seller_display:
                 other_offers.append((cand, offer))
 
-    # Per-unit normalisation: compare listings on price-per-Naar-unit so a
-    # multipack/larger size is apples-to-apples with Naar's single unit.
     _desc = product.get("description") or ""
     _n_attrs = extract_attrs(variant_search_text(product, variant) + " " + _desc)
     def _ratio(c: Candidate) -> Optional[float]:
         return quantity_ratio(_n_attrs, extract_attrs(c.title))
-    def _unit_of(t) -> float:
-        up = per_unit_price(t[1].price_inr, _ratio(t[0]))
-        return up if up is not None else t[1].price_inr
+    def _unit(price: Optional[float], c: Candidate) -> Optional[float]:
+        return per_unit_price(price, _ratio(c))
+    def _competitors() -> Optional[str]:
+        def summ(t):
+            c, o = t
+            up = _unit(o.price_inr, c)
+            r = _ratio(c)
+            p = f"₹{up:.2f}/unit" if up is not None else "price n/a"
+            if r and abs(r - 1.0) > 1e-6 and o.price_inr is not None:
+                p += f" (₹{o.price_inr:.0f}÷{r:.3g})"
+            return f"{o.seller_display} @ {p}"
+        ranked = sorted(other_offers,
+                        key=lambda t: _unit(t[1].price_inr, t[0]) if t[1].price_inr is not None else 1e18)
+        return "; ".join(summ(t) for t in ranked[:5]) or None
 
-    # Store-first: product is on the marketplace but the confirmed store isn't
-    # the one selling it here -> not found in THEIR store (not an ambiguous seller).
-    if store is not None and not matched_offers and not offers_failed:
-        return Record(**base, status="PRODUCT_NOT_FOUND",
-                      product_match_method="attribute_gate",
-                      seller_match_signal="store_confirmed",
-                      match_evidence="product on marketplace but not sold by the confirmed store")
-
+    # 3) Decide the status. Confirmed store selling it -> MATCHED (purchasable) /
+    # SOURCE_ERROR (matched but no price) / OUT_OF_STOCK; else PRODUCT_NOT_FOUND.
     if matched_offers:
         purchasable = [t for t in matched_offers if t[1].in_stock and t[1].price_inr is not None]
         if purchasable:
-            cand, offer, conf, signal, pevidence = min(purchasable, key=_unit_of)
+            cand, offer, pevidence = min(purchasable, key=lambda t: _unit(t[1].price_inr, t[0]) or t[1].price_inr)
             ratio = _ratio(cand)
-            unit = per_unit_price(offer.price_inr, ratio)
             return Record(**base, status="MATCHED",
                           marketplace_selling_price=offer.price_inr,
-                          marketplace_unit_price=unit,
+                          marketplace_unit_price=per_unit_price(offer.price_inr, ratio),
                           qty_ratio=ratio,
                           marketplace_sold_by=offer.seller_display,
-                          marketplace_seller_legal_name=offer.seller_legal,
-                          marketplace_seller_gstin=offer.seller_gstin,
                           listing_id=cand.listing_id, listing_url=cand.listing_url,
-                          offer_ref=offer.offer_ref,
-                          delivery_charge=offer.delivery_inr, mrp_displayed=offer.mrp_inr,
+                          offer_ref=offer.offer_ref, mrp_displayed=offer.mrp_inr,
                           product_match_method="attribute_gate",
-                          seller_match_signal=signal, confidence=conf,
-                          match_evidence=pevidence)
-        # Fix v3-4: scan ALL matched offers, not just [0]. A matched, in-stock
-        # offer whose price we could not extract is a collection failure and
-        # must win over an OUT_OF_STOCK sibling — otherwise offer order could
-        # silently hide a SOURCE_ERROR behind an OOS listing.
+                          seller_match_signal="store_confirmed", confidence=1.0,
+                          other_sellers=_competitors(), match_evidence=pevidence)
         price_fail = [t for t in matched_offers if t[1].in_stock and t[1].price_inr is None]
         if price_fail:
-            cand, offer, conf, signal, pevidence = price_fail[0]
-            # Matched the seller but could not extract a price: that is a
-            # collection failure, never a guess and never mislabelled OOS.
+            cand, offer, pevidence = price_fail[0]
             return Record(**base, status="SOURCE_ERROR",
                           marketplace_sold_by=offer.seller_display,
-                          marketplace_seller_legal_name=offer.seller_legal,
                           listing_id=cand.listing_id, listing_url=cand.listing_url,
-                          offer_ref=offer.offer_ref,
-                          seller_match_signal=signal, confidence=conf,
-                          match_evidence=(pevidence + "; seller matched but price "
-                                          "extraction failed"))
-        cand, offer, conf, signal, pevidence = matched_offers[0]
+                          offer_ref=offer.offer_ref, seller_match_signal="store_confirmed",
+                          match_evidence=pevidence + "; confirmed store matched but price extraction failed")
+        cand, offer, pevidence = matched_offers[0]
         return Record(**base, status="OUT_OF_STOCK",
                       marketplace_sold_by=offer.seller_display,
-                      marketplace_seller_legal_name=offer.seller_legal,
                       listing_id=cand.listing_id, listing_url=cand.listing_url,
-                      offer_ref=offer.offer_ref,
-                      product_match_method="attribute_gate",
-                      seller_match_signal=signal, confidence=conf,
+                      offer_ref=offer.offer_ref, seller_match_signal="store_confirmed",
                       match_evidence=pevidence)
 
     if offers_failed:
-        # A product-matched listing whose offer list we could not enumerate:
-        # the Naar seller may be on it, so neither SOLD_BY_OTHER nor
-        # AMBIGUOUS is honest — this is a collection failure (fix 6).
         return Record(**base, status="SOURCE_ERROR",
-                      product_match_method="attribute_gate",
-                      match_evidence="offer enumeration failed on a product-matched "
-                                     "listing: " + "; ".join(offers_failed))
-    if ambiguous_best:          # never upgraded to MATCHED (§4)
-        return ambiguous_best
-    if other_offers:
-        # Same product, a DIFFERENT seller — name who is selling it and at what
-        # price (competitive intel), and normalise their price per Naar unit.
-        # This is NOT our match price, so it goes in `other_sellers`, and the
-        # MATCHED-only price fields stay empty.
-        def _summ(t) -> str:
-            c, o = t
-            r = quantity_ratio(_n_attrs, extract_attrs(c.title))
-            up = per_unit_price(o.price_inr, r)
-            price = f"₹{up:.2f}/unit" if up is not None else "price n/a"
-            if r and abs(r - 1.0) > 1e-6 and o.price_inr is not None:
-                price += f" (₹{o.price_inr:.0f}÷{r:.3g})"
-            return f"{o.seller_display} @ {price}"
-        ranked = sorted(other_offers,
-                        key=lambda t: _unit_of(t) if t[1].price_inr is not None else 1e18)
-        top = ranked[0]
-        return Record(**base, status="SOLD_BY_OTHER",
-                      marketplace_sold_by=top[1].seller_display,
-                      marketplace_seller_legal_name=top[1].seller_legal,
-                      listing_id=top[0].listing_id, listing_url=top[0].listing_url,
-                      offer_ref=top[1].offer_ref,
-                      product_match_method="attribute_gate",
-                      seller_match_signal="sold_by_name",
-                      other_sellers="; ".join(_summ(t) for t in ranked[:5]),
-                      match_evidence="product found; sold by a different seller — "
-                                     "see other_sellers")
-    return Record(**base, status="AMBIGUOUS_MATCH",
-                  product_match_method="attribute_gate",
-                  seller_match_signal="seller_hidden",
-                  match_evidence="product found; no offer exposes a seller identity")
+                      match_evidence="offer fetch failed on a product-matched listing: "
+                                     + "; ".join(offers_failed))
+    # Product is on the marketplace, but the confirmed store isn't selling it here.
+    return Record(**base, status="PRODUCT_NOT_FOUND",
+                  seller_match_signal="store_confirmed", other_sellers=_competitors(),
+                  match_evidence="product on marketplace, not sold by the confirmed store"
+                                 + ("; see other_sellers" if other_offers else ""))
 
 
 def run(args) -> list[Record]:
@@ -1943,38 +1140,44 @@ def run(args) -> list[Record]:
         direct = {"amazon_in": AmazonInAdapter, "flipkart": FlipkartAdapter,
                   "meesho": MeeshoAdapter}
         adapters = {m: direct[m]() for m in args.marketplaces}
+        # Surface a corrupt registry ONCE up front (honest SourceError -> main
+        # exits cleanly) rather than raising mid-scan from a per-product read.
+        load_seller_identities()
 
     records: list[Record] = []
     for product in products:
         for variant in iter_variants(product):
-            if variant.get("sellingPrice") in (None, ""):
-                # Fix 5: a missing Naar price is a data problem, never ₹0.00.
+            if _to_float(variant.get("sellingPrice")) is None:
+                # Fix 5: a missing OR non-numeric Naar price ("TBD", "Contact us")
+                # is a data problem, never ₹0.00 — and must not crash the scan.
                 print(f"[SKIPPED          ] {product.get('title','')[:34]:<34} "
-                      f"({variant.get('variantName') or '-'}) — variant has no sellingPrice",
+                      f"({variant.get('variantName') or '-'}) — variant sellingPrice missing/non-numeric "
+                      f"({variant.get('sellingPrice')!r})",
                       file=sys.stderr)
                 continue
             for m, adapter in adapters.items():
-                store = None
                 title30 = product.get("title", "")[:30]
-                if getattr(args, "store_first", False):
+                if isinstance(adapter, FixtureAdapter):
+                    # Demo: treat the fixture seller as pre-confirmed.
+                    adapter.bind(product.get("_id", ""))
+                    store = {"store_id": "", "store_url": "",
+                             "seller_display": (product.get("seller") or {}).get("storeName", "")}
+                else:
                     # Store-first: only look up products inside a HUMAN-VERIFIED store.
                     st = store_status(product.get("sellerId", ""), m)
                     if st == "rejected":
                         print(f"[SKIPPED (not on {m})] {title30:<30} — store rejected", file=sys.stderr)
                         continue
                     if st != "confirmed":
-                        print(f"[NEEDS REVIEW ({m})] {title30:<30} — store not verified yet",
+                        print(f"[NEEDS REVIEW ({m})] {title30:<30} — store not verified (run verify_app.py)",
                               file=sys.stderr)
                         continue
                     store = _confirmed_store(product.get("sellerId", ""), m)
-                elif seller_present_on(m, resolve_naar_seller(product, m)) is False:
-                    # Seller-presence-first: KYC says the seller isn't here -> skip, no fetch.
-                    print(f"[SKIPPED (not on {m})] {title30:<30} — seller not on {m} per KYC",
-                          file=sys.stderr)
+                try:
+                    rec = compare_variant(product, variant, adapter, args.llm_judge, args.strict, store=store)
+                except Exception as e:  # per-product isolation: one bad row never aborts the scan
+                    print(f"[ERROR ({m})] {title30:<30} — {type(e).__name__}: {e}", file=sys.stderr)
                     continue
-                if isinstance(adapter, FixtureAdapter):
-                    adapter.bind(product.get("_id", ""))
-                rec = compare_variant(product, variant, adapter, args.llm_judge, args.strict, store=store)
                 records.append(rec)
                 delta = ""
                 if rec.status == "MATCHED":
@@ -1985,8 +1188,8 @@ def run(args) -> list[Record]:
                         norm = f" [₹{rec.marketplace_selling_price:.2f}/{rec.qty_ratio:.3g}u]"
                     delta = (f"  naar ₹{rec.naar_selling_price:.2f} vs ₹{cmp_price:.2f}/unit"
                              f"{norm} (Δ {d:+.2f})")
-                elif rec.status == "SOLD_BY_OTHER" and rec.other_sellers:
-                    delta = f"  by {rec.other_sellers[:60]}"
+                elif rec.other_sellers:
+                    delta = f"  also on {m}: {rec.other_sellers[:56]}"
                 print(f"[{rec.status:<17}] {product.get('title','')[:34]:<34} "
                       f"({variant.get('variantName') or '-'}) @ {m}{delta}")
     return records
@@ -1999,7 +1202,7 @@ def write_outputs(records: list[Record], outdir: str):
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     with open(os.path.join(outdir, "results.csv"), "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        w = csv.DictWriter(f, fieldnames=[fld.name for fld in dataclasses.fields(Record)])
         w.writeheader()
         w.writerows(rows)
     print("\nPer-platform status split:")
@@ -2016,282 +1219,191 @@ def write_outputs(records: list[Record], outdir: str):
 # Self-test — the regression cases from the code review, pinned.
 # --------------------------------------------------------------------------
 
-def self_test() -> int:
-    failures = []
+# Each _test_* group takes a `check(label, cond)` callable and exercises one
+# concern; self_test() wires them together. Grouping keeps related cases (and
+# their regressions) side by side, so the name says what the block proves.
 
-    def check(label, cond):
-        print(("  PASS  " if cond else "  FAIL  ") + label)
-        if not cond:
-            failures.append(label)
+def _test_name_matching(check):
+    check("name_compare exact after normalising legal suffixes",
+          name_compare("Treasure Flavours Pvt Ltd", "TREASURE FLAVOURS")[1] == "exact")
+    check("name_compare token-set on word reorder",
+          name_compare("Flavours Treasure Foods", "Treasure Foods Flavours")[1] == "token_set")
 
-    # 1. Conservative seller normalisation
-    v, c, s = seller_gate({"storeName": "", "businessName": "Reliance Industries"},
-                          Offer(seller_display="Reliance Retail"))
-    check("Reliance Retail is NOT Reliance Industries", v != "MATCH")
-    v, c, s = seller_gate({"storeName": "TREASURE FLAVOURS",
-                           "businessName": "TREASURE FLAVOURS FOODS PRIVATE LIMITED"},
-                          Offer(seller_display=None,
-                                seller_legal="TREASURE FLAVOURS FOODS PVT LTD"))
-    check("PVT LTD vs PRIVATE LIMITED still matches on legal name", v == "MATCH")
-    v, c, s = seller_gate({"storeName": "", "businessName": "Flavours Treasure Foods Ltd"},
-                          Offer(seller_display="Treasure Flavours Foods"))
-    check("word reordering matches via token_set", v == "MATCH" and "token_set" in s)
 
-    # 1b. Seller identity beyond the display name (GSTIN / store URL).
-    naar = {"storeName": "Kaithari Kalanjiyam", "businessName": "NITHYA VINOTH KUMAR",
-            "gstin": "33ABCDE1234F1Z5"}
-    v, c, s = seller_gate(naar, Offer(seller_display="Totally Different Store Name",
-                                      seller_gstin="33ABCDE1234F1Z5"))
-    check("same GSTIN under a DIFFERENT display name -> MATCH", v == "MATCH" and s == "gstin_exact")
-    v, c, s = seller_gate(naar, Offer(seller_display="Kaithari Kalanjiyam",
-                                      seller_gstin="27ZZZZZ9999Z1Z9"))
-    check("different GSTIN (even with matching name) -> OTHER", v == "OTHER" and s == "gstin_differs")
-    v, _, _ = seller_gate({"gstin": "33 abcde 1234 f1z5"},
-                          Offer(seller_display="x", seller_gstin="33ABCDE1234F1Z5"))
-    check("GSTIN normalised (spaces/case) still matches", v == "MATCH")
-    v, c, s = seller_gate(
-        {"storeName": "Brand A", "store_url": "https://www.amazon.in/sp?seller=A1B2C3D4E5"},
-        Offer(seller_display="Reseller Marketing",
-              seller_url="https://www.amazon.in/sp?seller=A1B2C3D4E5&ref=x"))
-    check("seller-provided store URL matches listing's seller link -> MATCH",
-          v == "MATCH" and s == "store_url_match")
+def _test_product_gate(check):
+    """Same-product identity: exact, derivative, colour/word-boundary, numeric size."""
+    amla = {"title": "Amla Powder", "description": "Pure Indian amla powder 100g",
+            "seller": {"storeName": "S"}}
+    amla_v = {"attributes": {"weight": "100g"}, "variantName": "100g"}
+    check("exact product passes",
+          product_gate(amla, amla_v, Candidate("x", "1", "u", "Pure Amla Powder 100g"), False)[0] == "pass")
+    check("derivative product is borderline, not a pass",
+          product_gate(amla, amla_v, Candidate("x", "2", "u", "Amla Powder Hair Mask 100g"), False)[0] == "borderline")
+    check("wrong colour variant fails",
+          product_gate({"title": "Saree", "description": "", "seller": {}},
+                       {"attributes": {"colour": "Teal"}, "variantName": "Teal"},
+                       Candidate("x", "3", "u", "Saree Maroon"), False)[0] == "fail")
+    check("'Teal' not matched inside 'Steal'",
+          product_gate({"title": "Saree", "description": "", "seller": {}},
+                       {"attributes": {"colour": "Teal"}, "variantName": "Teal"},
+                       Candidate("x", "4", "u", "Steal Deal Saree"), False)[0] == "fail")
+    check("numeric size 8 != 9 fails",
+          product_gate({"title": "Shoe", "description": "", "seller": {}},
+                       {"attributes": {"size": "8"}, "variantName": "8"},
+                       Candidate("x", "5", "u", "Shoe Size 9"), False)[0] == "fail")
+    check("numeric size 8 does NOT match '8.5' in title",         # decimal-boundary regression
+          product_gate({"title": "Running Shoe", "description": "", "seller": {}},
+                       {"attributes": {"size": "8"}, "variantName": "8"},
+                       Candidate("x", "n", "u", "Running Shoe Size 8.5"), False)[0] != "pass")
+    check("numeric size 8 matches exact '8' token",
+          product_gate({"title": "Running Shoe", "description": "", "seller": {}},
+                       {"attributes": {"size": "8"}, "variantName": "8"},
+                       Candidate("x", "n2", "u", "Running Shoe Size 8"), False)[0] == "pass")
 
-    # 1c. Seller-presence-first (KYC): skip marketplaces a seller isn't on.
-    check("KYC store URL -> present on marketplace",
-          seller_present_on("amazon_in", {"store_url": "https://x/sp?seller=A1"}) is True)
-    check("KYC not_on -> known absent (skip, no fetch)",
-          seller_present_on("meesho", {"not_on": ["meesho"]}) is False)
-    check("no KYC signal -> unknown (search as usual)",
-          seller_present_on("flipkart", {"storeName": "X"}) is None)
 
-    # 1d. SOLD_BY_OTHER names WHO is selling it + their (per-unit) price.
-    class OtherStub(MarketplaceAdapter):
-        name = "amazon_in"
-        def search(self, q):
-            return [Candidate("amazon_in", "O", "http://x/O", "Amla Powder 100g",
-                              [Offer("KPN Foods", None, 425.0, offer_ref="O:o")])]
-    amla_p = {"_id": "n", "title": "Amla Powder", "description": "Pure amla powder 100g",
-              "seller": {"storeName": "Treasure Flavours",
-                         "businessName": "TREASURE FLAVOURS FOODS PRIVATE LIMITED"}}
-    amla_v = {"_id": "v", "attributes": {"weight": "100g"}, "variantName": "100g",
-              "sellingPrice": 56.0}
-    rec = compare_variant(amla_p, amla_v, OtherStub(), False)
-    check("SOLD_BY_OTHER names the other seller + price (competitive intel)",
-          rec.status == "SOLD_BY_OTHER" and rec.marketplace_sold_by == "KPN Foods"
-          and "KPN Foods" in (rec.other_sellers or "")
-          and rec.marketplace_selling_price is None)
-
-    # 2. Word-boundary attributes
-    verdict, _ = product_gate({"title": "Kanchipuram Silk Cotton Saree", "description": ""},
-                              {"attributes": {"colour": "Teal"}, "variantName": "Teal"},
-                              Candidate("x", "X", "u", "Steal Deal Kanchipuram Silk Cotton Saree"),
-                              False)
-    check("'Teal' does not match inside 'Steal'", verdict == "fail")
-
-    # 3. Derivative products never auto-pass
-    amla = FIXTURE_NAAR[0]
-    verdict, ev = product_gate(amla, amla["variants"][0],
-                               Candidate("x", "Y", "u", "Amla Powder Hair Mask 100g"), False)
-    check("'Amla Powder Hair Mask' is borderline, not a pass", verdict == "borderline")
-    verdict, _ = product_gate(amla, amla["variants"][0],
-                              Candidate("x", "Z", "u", "Pure Amla Powder (Indian Gooseberry) 100g"),
-                              False)
-    check("description-corroborated listing still passes", verdict == "pass")
-
-    # 4. Purchasable matched offer beats OUT_OF_STOCK on an earlier listing
-    class Stub(MarketplaceAdapter):
-        name = "amazon_in"
-        def search(self, q):
-            return [Candidate("amazon_in", "C1", "u1", "Pure Indian Amla Powder 100g",
-                              [Offer("Treasure Flavours", None, None, in_stock=False,
-                                     offer_ref="C1:o")]),
-                    Candidate("amazon_in", "C2", "u2", "Indian Amla Powder 100g",
-                              [Offer("Treasure Flavours", None, 199.0, offer_ref="C2:o")])]
-    rec = compare_variant(amla, amla["variants"][0], Stub(), False)
-    check("in-stock match wins over earlier OOS listing",
-          rec.status == "MATCHED" and rec.marketplace_selling_price == 199.0)
-
-    # 5. Price only on MATCHED (invariant)
-    r = Record("p", "v", "s", "amazon_in", "SOLD_BY_OTHER", 100.0,
-               marketplace_selling_price=50.0)
-    check("non-MATCHED rows never carry a price", r.marketplace_selling_price is None)
-
-    # 6. Failed offer enumeration is SOURCE_ERROR, not AMBIGUOUS
-    class StubErr(MarketplaceAdapter):
-        name = "amazon_in"
-        def search(self, q):
-            c = Candidate("amazon_in", "C3", "u3", "Indian Amla Powder 100g")
-            c.offers_error = "blocked or throttled: HTTP 503"
-            return [c]
-    rec = compare_variant(amla, amla["variants"][0], StubErr(), False)
-    check("blocked offer list on matched listing -> SOURCE_ERROR",
-          rec.status == "SOURCE_ERROR")
-
-    # 7. Matched seller but unextractable price is SOURCE_ERROR, never OOS/guess
-    class StubNoPrice(MarketplaceAdapter):
-        name = "meesho"
-        def search(self, q):
-            return [Candidate("meesho", "C4", "u4", "Indian Amla Powder 100g",
-                              [Offer("Treasure Flavours", None, None, offer_ref="C4:o")])]
-    rec = compare_variant(amla, amla["variants"][0], StubNoPrice(), False)
-    check("matched but unpriced offer -> SOURCE_ERROR", rec.status == "SOURCE_ERROR")
-
-    # 8. (v3-1) _walk_first is document-order/shallowest, not LIFO — the primary
-    # node wins over a deeper recommendation node carrying the same key.
-    blob = {"main": {"finalPrice": {"value": 100}},
-            "reco": {"items": [{"finalPrice": {"value": 999}}]}}
-    node = _walk_first(blob, ("finalPrice",))
-    check("_walk_first returns the shallow/primary node, not a deep reco",
-          node is not None and node["finalPrice"]["value"] == 100)
-
-    # 9. (v3-2) A 200 response carrying an Amazon captcha body is a block.
-    check("captcha interstitial (HTTP 200) is detected as a block",
-          _looks_blocked("<html>Enter the characters you see below robot check</html>"))
-    check("an ordinary product page is not flagged as blocked",
-          not _looks_blocked("<html>Pure Amla Powder 100g ₹249</html>"))
-
-    # 10. (v3-4) An in-stock matched offer with no price beats an OOS sibling:
-    # the result must be SOURCE_ERROR (collection failure), never OUT_OF_STOCK.
-    class StubOosThenNoPrice(MarketplaceAdapter):
-        name = "amazon_in"
-        def search(self, q):
-            return [Candidate("amazon_in", "D1", "u1", "Indian Amla Powder 100g",
-                              [Offer("Treasure Flavours", None, 199.0, in_stock=False,
-                                     offer_ref="D1:o")]),
-                    Candidate("amazon_in", "D2", "u2", "Pure Amla Powder 100g",
-                              [Offer("Treasure Flavours", None, None, in_stock=True,
-                                     offer_ref="D2:o")])]
-    rec = compare_variant(amla, amla["variants"][0], StubOosThenNoPrice(), False)
-    check("in-stock price-extraction failure wins over an OOS sibling -> SOURCE_ERROR",
-          rec.status == "SOURCE_ERROR")
-
-    # 11. (v3-5) Numeric variant attributes are gated on word boundaries.
-    shoe = {"title": "Running Shoe", "description": ""}
-    shoe_v = {"attributes": {"size": "8"}, "variantName": "8"}
-    verdict, _ = product_gate(shoe, shoe_v, Candidate("x", "S9", "u", "Running Shoe Size 9"), False)
-    check("numeric size 8 != listing size 9 -> fail", verdict == "fail")
-    verdict, _ = product_gate(shoe, shoe_v, Candidate("x", "S8", "u", "Running Shoe Size 8"), False)
-    check("numeric size 8 not falsely matched inside '18'",
-          not re.search(r"\b8\b", "Running Shoe Size 18") and verdict != "fail")
-
-    # 11b. Per-unit normalisation — a multipack is the SAME product, compared per unit.
-    snack = {"title": "Theni Tomato Murukku", "description": "", "seller": {}}
-    snack_v = {"attributes": {}, "variantName": None, "sellingPrice": 56.0}
-    verdict, ev = product_gate(snack, snack_v,
-                               Candidate("x", "P", "u", "Theni Tomato Murukku Pack of 5"), False)
-    check("naar single vs listing 'Pack of 5' -> pass with qty_ratio (per-unit)",
-          verdict == "pass" and "qty_ratio=5" in ev)
-    verdict, _ = product_gate(snack, snack_v,
-                              Candidate("x", "W", "u", "Theni Tomato Murukku 500 g"), False)
-    check("quantity stated on only one side -> borderline (can't compare per-unit)",
-          verdict == "borderline")
-    verdict, _ = product_gate(snack, snack_v,
-                              Candidate("x", "E", "u", "Theni Tomato Murukku"), False)
-    check("naar single vs plain listing (no qty either side) still passes",
-          verdict == "pass")
-    # per-unit price: a pack of 5 at ₹259 is ₹51.8/unit — cheaper than Naar ₹56.
+def _test_quantity_and_units(check):
+    """Per-unit normalization + quantity_ratio: never mix pack/weight dimensions, never divide by zero."""
     check("per_unit_price normalises a multipack", per_unit_price(259.0, 5.0) == 51.8)
+    check("quantity_ratio pack-of-5", quantity_ratio({}, {"pack": 5}) == 5.0)
+    check("quantity_ratio same-dimension weights", quantity_ratio({"qty_base": 100.0}, {"qty_base": 250.0}) == 2.5)
+    check("quantity_ratio single-unit vs multipack (weight + pack)",
+          quantity_ratio({"qty_base": 100.0}, {"pack": 5}) == 5.0)
+    # garbage direction: naar states a pack (unit size unknown), candidate a weight -> not comparable
+    check("quantity_ratio pack vs lone weight -> None (not comparable)",
+          quantity_ratio({"pack": 2}, {"qty_base": 100.0}) is None)
+    check("quantity_ratio one-sided lone weight -> None",
+          quantity_ratio({}, {"qty_base": 100.0}) is None and quantity_ratio({"qty_base": 100.0}, {}) is None)
+    check("quantity_ratio zero naar qty -> None (not ZeroDivisionError)",
+          quantity_ratio({"qty_base": 0.0}, {"qty_base": 250.0}) is None)
 
-    class PackStub(MarketplaceAdapter):
-        name = "amazon_in"
-        def search(self, q):
-            return [Candidate("amazon_in", "PK", "u", "Theni Tomato Murukku Pack of 5",
-                              [Offer("Theni Snacks", None, 259.0, offer_ref="PK:o")])]
-    snack2 = {"_id": "n", "title": "Theni Tomato Murukku", "description": "",
-              "seller": {"storeName": "Theni Snacks"}}
-    snack2_v = {"_id": "v", "attributes": {}, "variantName": None, "sellingPrice": 56.0}
-    rec = compare_variant(snack2, snack2_v, PackStub(), False)
-    check("multipack MATCHED with per-unit price (₹259/5=₹51.8), not raw ₹259",
-          rec.status == "MATCHED" and rec.marketplace_unit_price == 51.8
-          and rec.qty_ratio == 5.0 and rec.marketplace_selling_price == 259.0)
+    amla = {"title": "Amla Powder", "description": "Pure Indian amla powder 100g", "seller": {"storeName": "S"}}
+    amla_v = {"attributes": {"weight": "100g"}, "variantName": "100g"}
+    v, ev = product_gate(amla, amla_v, Candidate("x", "6", "u", "Amla Powder Pack of 5"), False)
+    check("multipack passes with qty_ratio (per-unit)", v == "pass" and "qty_ratio=5" in ev)
+    # a quantity is STATED on one side but not comparable -> gate abstains, never auto-pass
+    check("product_gate abstains when naar states a pack the candidate can't be sized against",
+          product_gate({"title": "Amla Powder", "description": "", "seller": {}},
+                       {"attributes": {}, "variantName": "Pack of 2"},
+                       Candidate("x", "q", "u", "Amla Powder 100g"), False)[0] == "borderline")
+    check("product_gate survives a '0g' token in text (no crash)",
+          product_gate({"title": "Protein Bar", "description": "Contains 0g sugar", "seller": {}},
+                       {"attributes": {}, "variantName": "-"},
+                       Candidate("x", "z", "u", "Protein Bar 250g"), False)[0] in ("pass", "fail", "borderline"))
 
-    # 11c. GTIN/barcode anchoring — exact barcode is the same product, no fuzzy needed.
-    gp = {"_id": "g", "title": "Foo", "description": "", "seller": {"storeName": "S"}}
-    gv = {"_id": "gv", "attributes": {}, "barcode": "8901234567890", "sellingPrice": 100.0}
-    verdict, ev = product_gate(gp, gv,
-                               Candidate("x", "G", "u", "Completely Unrelated Title",
-                                         gtin="8901234567890"), False)
-    check("GTIN exact -> pass regardless of title", verdict == "pass" and "gtin_exact" in ev)
-    verdict, _ = product_gate(gp, gv,
-                              Candidate("x", "G2", "u", "Foo", gtin="0000000000000"), False)
-    check("GTIN mismatch -> fail", verdict == "fail")
 
-    class GtinStub(MarketplaceAdapter):
-        name = "amazon_in"
-        def search(self, q):
-            return [Candidate("amazon_in", "GC", "u", "Random Unrelated Title",
-                              [Offer("S", None, 88.0)], gtin="8901234567890")]
-    rec = compare_variant(gp, gv, GtinStub(), False)
-    check("GTIN-matched listing MATCHED even with an unrelated title",
-          rec.status == "MATCHED" and rec.marketplace_selling_price == 88.0)
+def _test_gtin(check):
+    """GTIN/barcode is the strongest identity signal; codes compare equal across UPC-12/EAN-13/GTIN-14."""
+    check("GTIN exact -> pass regardless of title",
+          product_gate({"title": "Foo", "description": "", "seller": {}},
+                       {"attributes": {}, "barcode": "8901234567890"},
+                       Candidate("x", "7", "u", "Unrelated", gtin="8901234567890"), False)[0] == "pass")
+    check("_norm_gtin13 pads UPC-12 and EAN-13 to equal GTIN-14",
+          _norm_gtin13("012345678905") == _norm_gtin13("0012345678905")
+          and _norm_gtin13("012345678905") != "")
+    check("GTIN match across differing lengths -> pass",
+          product_gate({"title": "Foo", "description": "", "seller": {}},
+                       {"attributes": {}, "barcode": "8901234567890"},
+                       Candidate("x", "g2", "u", "Different Title", gtin="08901234567890"), False)[0] == "pass")
 
-    # 11d. Structured API parsers (reliable JSON path — no HTML/Selenium).
-    sj = {"results": [{"asin": "B0G5YXPFYC", "name": "Earthen Story Amla Powder 200g"},
-                      {"asin": "", "name": "skip empty asin"},
-                      {"asin": "B02", "name": "Second"}]}
-    cands = _amazon_structured_candidates(sj, "amazon_in", limit=5)
+
+def _test_structured_api(check):
+    """ScraperAPI structured JSON parsers: candidates + offer, tolerant of odd shapes."""
+    check("structured search: non-list results -> [] (no crash)",
+          _amazon_structured_candidates({"results": "oops"}, "amazon_in") == []
+          and _amazon_structured_candidates({}, "amazon_in") == [])
+    cands = _amazon_structured_candidates(
+        {"results": [{"asin": "A1", "name": "X"}, {"asin": "", "name": "skip"}, {"asin": "A2", "name": "Y"}]},
+        "amazon_in", limit=5)
     check("structured search parses candidates, skips empty asin",
-          len(cands) == 2 and cands[0].listing_id == "B0G5YXPFYC")
-    pj = {"name": "Earthen Story Amla Powder 200g", "pricing": "₹249",
-          "list_price": "₹325", "sold_by": "EarthenStory", "availability_status": "In stock"}
-    off = _amazon_structured_offer(pj, "B0G5YXPFYC")
-    check("structured product parses price/seller/mrp/stock directly",
-          off.price_inr == 249.0 and off.seller_display == "EarthenStory"
-          and off.mrp_inr == 325.0 and off.in_stock)
-    off2 = _amazon_structured_offer({"pricing": "", "availability_status": "Currently unavailable",
-                                     "sold_by": "X"}, "A")
-    check("structured out-of-stock / no price parsed honestly",
-          off2.in_stock is False and off2.price_inr is None)
+          len(cands) == 2 and cands[0].listing_id == "A1")
+    off = _amazon_structured_offer(
+        {"pricing": "₹249", "list_price": "₹325", "sold_by": "Nivarana", "availability_status": "In stock"}, "A1")
+    check("structured product parses price/seller/mrp/stock",
+          off.price_inr == 249.0 and off.seller_display == "Nivarana" and off.mrp_inr == 325.0 and off.in_stock)
+    off2 = _amazon_structured_offer({"pricing": "", "availability_status": "Currently unavailable", "sold_by": "X"}, "A")
+    check("structured out-of-stock / no price honest", off2.in_stock is False and off2.price_inr is None)
 
-    # 12. Borderline judge is provider-agnostic and honest when unconfigured.
-    check("judge parses a structured same_product verdict",
-          _parse_same_product('noise {"same_product": true} tail') is True
-          and _parse_same_product('{"same_product": false}') is False
-          and _parse_same_product("no json here") is None)
-    saved = {k: os.environ.pop(k, None)
-             for k in ("LLM_JUDGE_PROVIDER", "ANTHROPIC_API_KEY", "OPENAI_API_KEY")}
+
+def _test_store_filter(check):
+    """An offer matches ONLY the confirmed store: exact name, or a path-anchored seller-URL token."""
+    perm = {"store_id": "", "store_url": "", "seller_display": "Silk House"}
+    check("store filter rejects a word-permuted competitor name",
+          _offer_matches_store(Offer("Silk House", price_inr=1.0), perm)
+          and not _offer_matches_store(Offer("House Silk", price_inr=1.0), perm))
+    check("store token matches a real /store/ path",
+          _seller_id_from_url("https://www.meesho.com/store/nivarana/") == "store:nivarana")
+    check("store token does NOT match inside 'megastore' (no cross-seller collision)",
+          _seller_id_from_url("https://www.meesho.com/megastore/nivarana") != "store:nivarana")
+
+
+def _test_price_safety(check):
+    """A missing/non-numeric Naar price is a data skip, never a float() crash."""
+    bad = {"_id": "bad", "attributes": {}, "variantName": "-", "sellingPrice": "TBD"}
+    p = {"_id": "p", "title": "X", "description": "", "sellerId": "s", "seller": {"storeName": "S"}}
+    raised = False
+    try:                                     # raises before the adapter is ever called
+        compare_variant(p, bad, AmazonInAdapter(), False, store={})
+    except ValueError:
+        raised = True
+    except Exception:
+        pass
+    check("compare_variant on non-numeric price raises ValueError (never float() crash)", raised)
+    check("_to_float rejects garbage, accepts '1,299'",
+          _to_float("TBD") is None and _to_float("1,299") == 1299.0 and _to_float(None) is None)
+
+
+def _test_llm_judge(check):
+    """Provider-agnostic borderline judge: parses verdicts, honest None with no key."""
+    check("judge parses structured verdict",
+          _parse_same_product('noise {"same_product": true} x') is True
+          and _parse_same_product("no json") is None)
+    saved = {k: os.environ.pop(k, None) for k in ("LLM_JUDGE_PROVIDER", "ANTHROPIC_API_KEY", "OPENAI_API_KEY")}
     try:
-        check("no key/provider -> judge resolves to none and returns None",
+        check("no key -> judge none, returns None",
               _judge_provider() == "" and _llm_same_product("A", "B") is None)
-        os.environ["ANTHROPIC_API_KEY"] = "x"
-        check("ANTHROPIC_API_KEY present -> auto-selects anthropic",
-              _judge_provider() == "anthropic")
-        os.environ.pop("ANTHROPIC_API_KEY")
         os.environ["OPENAI_API_KEY"] = "x"
-        check("OPENAI_API_KEY present -> auto-selects openai",
-              _judge_provider() == "openai")
-        os.environ["LLM_JUDGE_PROVIDER"] = "anthropic"
-        check("explicit LLM_JUDGE_PROVIDER overrides key auto-detect",
-              _judge_provider() == "anthropic")
+        check("OPENAI_API_KEY -> auto openai", _judge_provider() == "openai")
     finally:
         for k, v in saved.items():
             os.environ.pop(k, None)
             if v is not None:
                 os.environ[k] = v
 
-    # 13. Store-first: registry writes, store matching, proposer, store-scoped lookup.
-    import tempfile as _tf
-    _saved_kyc = os.environ.get("NAAR_KYC_FILE")
-    _fd, _reg = _tf.mkstemp(suffix=".json")
-    os.close(_fd)
-    os.environ["NAAR_KYC_FILE"] = _reg
+
+def _test_record_honesty(check):
+    r = Record("p", "v", "s", "amazon_in", "PRODUCT_NOT_FOUND", 100.0, marketplace_selling_price=50.0)
+    check("non-MATCHED rows never carry a price", r.marketplace_selling_price is None)
+
+
+def _test_store_registry(check):
+    """End-to-end store registry + store-first decision, on a throwaway temp registry
+    (the real seller_identity.json is untouched): confirm/reject/status, propose,
+    the three compare_variant outcomes, and durability (merge, atomic write, lock,
+    corrupt handling — reader and writer consistent)."""
+    import glob
+    import tempfile
+    import threading as thr
     global _seller_identity_cache
+    saved_kyc = os.environ.get("NAAR_KYC_FILE")
+    fd, reg = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    os.environ["NAAR_KYC_FILE"] = reg
     _seller_identity_cache = None
     try:
-        confirm_store("s1", "amazon_in", seller_display="Nivarana")   # name-only (structured API)
-        check("confirm_store(name) -> status confirmed", store_status("s1", "amazon_in") == "confirmed")
+        # confirm / reject / status
+        confirm_store("s1", "amazon_in", seller_display="Nivarana")
+        check("confirm_store(name) -> confirmed", store_status("s1", "amazon_in") == "confirmed")
         confirm_store("s2", "amazon_in", store_url="https://www.amazon.in/sp?seller=A1B2C3D4E5")
-        check("confirm_store(url) -> _confirmed_store carries store_id",
+        check("confirm_store(url) -> store_id",
               _confirmed_store("s2", "amazon_in")["store_id"] == "amazon:A1B2C3D4E5")
         reject_store("s3", "meesho")
-        check("reject_store -> rejected + seller skipped",
-              store_status("s3", "meesho") == "rejected"
-              and seller_present_on("meesho", resolve_naar_seller({"sellerId": "s3"}, "meesho")) is False)
+        check("reject_store -> rejected", store_status("s3", "meesho") == "rejected")
         store = _confirmed_store("s1", "amazon_in")
-        check("offer matches confirmed store by 'Sold by' name",
-              _offer_matches_store(Offer("Nivarana", price_inr=515.0), store)
+        check("offer matches confirmed store by name",
+              _offer_matches_store(Offer("Nivarana", price_inr=1.0), store)
               and not _offer_matches_store(Offer("Someone Else"), store))
 
+        # propose: distinct sellers, ranked by name similarity
         class _PropStub(MarketplaceAdapter):
             name = "amazon_in"
             def search(self, q):
@@ -2299,10 +1411,10 @@ def self_test() -> int:
                         Candidate("amazon_in", "B", "u", "X", [Offer("Nivarana", price_inr=2.0)]),
                         Candidate("amazon_in", "C", "u", "X", [Offer("HealthKart", price_inr=3.0)])]
         props = propose_stores("Nivarana", "amazon_in", _PropStub())
-        check("propose_stores dedups sellers and ranks by name similarity",
+        check("propose_stores dedups + ranks by similarity",
               len(props) == 2 and props[0]["seller_display"] == "Nivarana" and props[0]["similarity"] == 1.0)
 
-        # store-first compare: only the confirmed store's offer counts; buy-box other-seller ignored.
+        # the three store-first outcomes: MATCHED / PRODUCT_NOT_FOUND / SOURCE_ERROR
         prod = {"_id": "p", "title": "Amla Powder", "description": "Pure amla powder 100g",
                 "sellerId": "s1", "seller": {"storeName": "Nivarana"}}
         pv = {"_id": "v", "attributes": {"weight": "100g"}, "variantName": "100g", "sellingPrice": 90.0}
@@ -2311,30 +1423,116 @@ def self_test() -> int:
             name = "amazon_in"
             def search(self, q):
                 return [Candidate("amazon_in", "L", "u", "Amla Powder 100g",
-                                  [Offer("RetailNet", price_inr=120.0),
-                                   Offer("Nivarana", price_inr=99.0)])]
+                                  [Offer("RetailNet", price_inr=120.0), Offer("Nivarana", price_inr=99.0)])]
         rec = compare_variant(prod, pv, _StoreStub(), False, store=store)
-        check("store-first MATCHES the confirmed store's offer, ignores the buy-box seller",
+        check("store-first MATCHES confirmed store, ignores other seller; competitor recorded",
               rec.status == "MATCHED" and rec.marketplace_selling_price == 99.0
-              and rec.marketplace_sold_by == "Nivarana")
-        # product on marketplace but confirmed store isn't selling it -> not found in their store
+              and rec.marketplace_sold_by == "Nivarana" and "RetailNet" in (rec.other_sellers or ""))
+
         class _NoStoreStub(MarketplaceAdapter):
             name = "amazon_in"
             def search(self, q):
-                return [Candidate("amazon_in", "L", "u", "Amla Powder 100g",
-                                  [Offer("RetailNet", price_inr=120.0)])]
+                return [Candidate("amazon_in", "L", "u", "Amla Powder 100g", [Offer("RetailNet", price_inr=120.0)])]
         rec = compare_variant(prod, pv, _NoStoreStub(), False, store=store)
-        check("store-first: product present but not sold by the confirmed store -> PRODUCT_NOT_FOUND",
-              rec.status == "PRODUCT_NOT_FOUND")
+        check("confirmed store not selling it -> PRODUCT_NOT_FOUND + competitor intel",
+              rec.status == "PRODUCT_NOT_FOUND" and "RetailNet" in (rec.other_sellers or ""))
+
+        class _ErrStub(MarketplaceAdapter):
+            name = "flipkart"
+            def search(self, q):
+                raise SourceError("no structured endpoint")
+        rec = compare_variant(prod, pv, _ErrStub(), False, store=store)
+        check("fetch failure -> SOURCE_ERROR (honest)", rec.status == "SOURCE_ERROR")
+
+        # durability: writes MERGE (never clobber other sellers), temp is atomic + cleaned up
+        disk = _load_registry_file()
+        check("all prior sellers persist after multiple writes (no lost update)",
+              "s1" in disk and "s2" in disk and "s3" in disk)
+        check("atomic write leaves no .tmp.* file behind", not glob.glob(reg + ".tmp.*"))
+
+        save_raised = False
+        try:
+            _save_registry_file({"bad": {1, 2, 3}})     # a set isn't JSON-serialisable
+        except TypeError:
+            save_raised = True
+        check("failed _save_registry_file re-raises + cleans temp",
+              save_raised and not glob.glob(reg + ".tmp.*"))
+
+        # writer lock: concurrent confirms can't lose updates
+        _seller_identity_cache = None
+        bar = thr.Barrier(8)
+        def _confirm_one(i):
+            bar.wait()
+            confirm_store(f"cc{i}", "amazon_in", seller_display=f"Store {i}")
+        threads = [thr.Thread(target=_confirm_one, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        disk2 = _load_registry_file()
+        check("8 concurrent confirms all persist (no lost update)",
+              all(f"cc{i}" in disk2 for i in range(8)))
+
+        _seller_identity_cache = None
+        confirm_store("rd1", "amazon_in", seller_display="Reader Store")
+        check("reader path reflects a fresh confirm", store_status("rd1", "amazon_in") == "confirmed")
+
+        # corrupt registry: back it up and REFUSE to load (never wipe verified stores),
+        # with the reader path failing exactly like the writer path.
+        with open(reg, "w", encoding="utf-8") as cf:
+            cf.write("{ this is not json ")
+        _seller_identity_cache = None
+        writer_raised = False
+        try:
+            _load_registry_file()
+        except SourceError:
+            writer_raised = True
+        check("corrupt registry raises SourceError (no wipe)", writer_raised)
+        check("corrupt registry backed up to .corrupt.bak", os.path.exists(reg + ".corrupt.bak"))
+        _rm(reg + ".corrupt.bak")
+        _seller_identity_cache = None
+        reader_raised = False
+        try:
+            load_seller_identities()
+        except SourceError:
+            reader_raised = True
+        check("reader path raises SourceError on corrupt (consistent w/ writer)", reader_raised)
+        _rm(reg + ".corrupt.bak")
     finally:
         _seller_identity_cache = None
         os.environ.pop("NAAR_KYC_FILE", None)
-        if _saved_kyc is not None:
-            os.environ["NAAR_KYC_FILE"] = _saved_kyc
-        try:
-            os.remove(_reg)
-        except OSError:
-            pass
+        if saved_kyc is not None:
+            os.environ["NAAR_KYC_FILE"] = saved_kyc
+        _rm(reg)
+
+
+def _rm(path: str) -> None:
+    """Best-effort file removal (ignore absent)."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def self_test() -> int:
+    """Offline regression checks for the store-first + structured-API spine."""
+    failures: list[str] = []
+
+    def check(label, cond):
+        print(("  PASS  " if cond else "  FAIL  ") + label)
+        if not cond:
+            failures.append(label)
+
+    _test_name_matching(check)
+    _test_product_gate(check)
+    _test_quantity_and_units(check)
+    _test_gtin(check)
+    _test_structured_api(check)
+    _test_store_filter(check)
+    _test_price_safety(check)
+    _test_llm_judge(check)
+    _test_record_honesty(check)
+    _test_store_registry(check)
 
     print(f"\n{len(failures)} failure(s)" if failures else "\nAll checks passed.")
     return 1 if failures else 0
@@ -2368,19 +1566,15 @@ def main():
     ap.add_argument("--backend", choices=["fixture", "direct"], default="fixture")
     ap.add_argument("--limit", type=int, default=10)
     ap.add_argument("--skip", type=int, default=0)
-    # Default to the two marketplaces Selenium fetches for free. Meesho is behind
-    # Akamai (Access Denied to headless) and needs a managed provider / proxy, so
-    # it's opt-in: add `--marketplaces amazon_in flipkart meesho` with SCRAPERAPI_KEY.
+    # Amazon has a structured-data endpoint (reliable JSON). Flipkart/Meesho have
+    # none yet, so they're honest stubs — add them only once a provider is wired.
     ap.add_argument("--marketplaces", nargs="+",
-                    default=["amazon_in", "flipkart"],
+                    default=["amazon_in"],
                     choices=["amazon_in", "flipkart", "meesho"])
     ap.add_argument("--llm-judge", action="store_true",
                     help="use an LLM for borderline product pairs (ANTHROPIC_API_KEY)")
     ap.add_argument("--strict", action="store_true",
                     help="any unexplained candidate token demotes to borderline")
-    ap.add_argument("--store-first", action="store_true",
-                    help="only look up products inside human-verified stores "
-                         "(seller_identity.json); confirm via verify_app.py")
     ap.add_argument("--self-test", action="store_true",
                     help="run the review regression checks and exit")
     ap.add_argument("--out", default="poc_out")

@@ -1,292 +1,133 @@
 # Naar marketplace price-matching — POC
 
-Proof-of-concept for the price-matching brief: for each active Naar product, find
-the *same seller* selling the *same product/variant* on Amazon India, Flipkart,
-and Meesho, and record the comparable INR price — **only** when both the product
-gate and the seller gate pass. Every row carries an honest status; a marketplace
-price is written only on `MATCHED` rows, from structured offer data, never a guess.
+For each active Naar product, find the **same seller** selling the **same
+product/variant** on a marketplace and record the comparable INR price — only
+when the seller's store is **human-verified** and the product genuinely matches.
+Every row carries an honest status; a price is written only on a `MATCHED` row.
+
+Two decisions shaped this design, both proven the hard way:
+- **Store names differ across platforms and can't be reliably auto-matched** →
+  so the store is **verified once by a human**, then products are looked up only
+  inside that verified store (store-first).
+- **Scraping HTML with a headless browser fails at scale** (~55% blocked) → so
+  fetching goes through a **structured data API** that returns reliable JSON.
 
 ---
 
 ## Quick start
 
-### Prerequisites
-- **Python 3.9+**
-- Offline commands (`--self-test`, `--backend fixture`, `eval_accuracy.py`,
-  `prove_llm.py`) need **no dependencies and no network** — stdlib only.
-- Live/`direct` runs need: `pip install requests beautifulsoup4`
-- Selenium fetch backend also needs: `pip install selenium undetected-chromedriver`
-  and a local **Google Chrome**.
-- Borderline judge (optional) needs `requests` + an API key (see below).
-
 ```bash
-pip install requests beautifulsoup4 selenium undetected-chromedriver
+pip install requests                      # + beautifulsoup4 only if you extend adapters
 ```
 
-### Run it — offline (no keys, no network)
+**1 · Sanity (offline, no keys):**
 ```bash
-python poc/naar_price_poc.py --self-test         # unit regressions (24 checks)
-python poc/naar_price_poc.py --backend fixture   # synthetic demo, exercises all six statuses
-python poc/eval_accuracy.py                       # matcher accuracy report (labeled set)
-python poc/prove_llm.py                           # provider-agnostic judge proof (mock server)
+python poc/naar_price_poc.py --self-test        # regression checks
+python poc/eval_accuracy.py                      # matcher precision (0 false matches)
+python poc/naar_price_poc.py --backend fixture   # offline demo (sellers pre-confirmed)
+python poc/prove_llm.py                          # provider-agnostic judge proof (mock)
 ```
 
-### Run it — live
-Defaults to **Amazon + Flipkart**, fetched free via headless Chrome:
+**2 · Verify stores** (the human step) — needs `SCRAPERAPI_KEY` in `poc/.env`:
 ```bash
-USE_SELENIUM=1 python poc/naar_price_poc.py --backend direct --limit 10
+python poc/verify_app.py        # open http://127.0.0.1:8765  (--fixture for offline sellers)
 ```
-With the borderline LLM judge (resolves uncertain product matches):
+For each seller it **auto-proposes** candidate stores (searches by the store/brand
+name, lists the distinct sellers behind the results ranked by similarity). You
+**Confirm** one, **paste** the correct store URL, or mark **Not on** that
+marketplace. Choices persist to `poc/seller_identity.json` (the store registry).
+
+**3 · Store-first run** — only verified stores are looked up:
 ```bash
-USE_SELENIUM=1 ANTHROPIC_API_KEY=sk-... \
-  python poc/naar_price_poc.py --backend direct --limit 10 --llm-judge
-```
-Add Meesho (needs a managed provider — it's behind Akamai):
-```bash
-SCRAPERAPI_KEY=... python poc/naar_price_poc.py --backend direct --limit 10 \
-  --marketplaces amazon_in flipkart meesho
+python poc/naar_price_poc.py --backend direct --limit 15 --marketplaces amazon_in --llm-judge
 ```
 
 ### CLI flags
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--backend fixture\|direct` | `fixture` | `fixture` = offline synthetic data; `direct` = live Naar API + marketplaces |
+| `--backend fixture\|direct` | `fixture` | offline demo vs live Naar API + marketplace |
 | `--limit` / `--skip` | `10` / `0` | Naar product pagination |
-| `--marketplaces` | `amazon_in flipkart` | subset of `amazon_in flipkart meesho` |
-| `--llm-judge` | off | use an LLM to adjudicate *borderline* product pairs |
+| `--marketplaces` | `amazon_in` | `amazon_in` (structured) + FK/Meesho stubs |
+| `--llm-judge` | off | adjudicate *borderline* product pairs (never sets price/seller) |
 | `--strict` | off | any unexplained candidate token demotes to borderline |
-| `--store-first` | off | only look up products inside **human-verified** stores (see below) |
-| `--self-test` | — | run regression checks and exit |
-| `--out` | `poc_out` | output directory |
+| `--out` | `poc_out` | output dir |
 
 ---
 
 ## How it works
 
-The core problem: Naar has **no** marketplace store URL or seller ID, so we can't
-start from "this seller's catalog". Instead we search each marketplace for the
-product, then **confirm two things independently** on each candidate listing —
-that it's the exact product/variant, *and* that it's sold by the same seller.
-Both gates must pass before a price is recorded.
-
-```mermaid
-flowchart TD
-    A[Naar products API] --> B[Per variant: build search query]
-    B --> C[Marketplace adapter: search -> candidate listings + offers]
-    C --> D{Product gate<br/>exact product & variant?}
-    D -->|no candidate passes| E[PRODUCT_NOT_FOUND]
-    D -->|only borderline| F[AMBIGUOUS_MATCH]
-    D -->|pass| G{Seller gate<br/>sold-by == Naar seller?}
-    G -->|different seller| H[SOLD_BY_OTHER]
-    G -->|hidden / near-miss| F
-    G -->|match, in stock, price| I[MATCHED + price]
-    G -->|match, out of stock| J[OUT_OF_STOCK]
-    G -->|match, price unextractable| K[SOURCE_ERROR]
+```
+verify store (human, once)   →  structured-API search (JSON: name, price, sold_by)
+   →  keep the confirmed store's offers   →  the store filter replaces fuzzy seller guessing
+   →  product gate (GTIN → per-unit → attributes → coverage → judge)
+   →  per-unit price compare               →  MATCH = same product, from the verified store
 ```
 
-**0 · Seller-presence-first (`seller_present_on`).** Before searching, KYC tells us
-whether the seller is even on a marketplace: if `not_on` lists it → **skip, no
-fetch** (the efficiency win — don't crawl absent sellers); if a store URL is on
-file → the seller is already confirmed. Only when presence is unknown do we search.
+**1 · Verify the store** (`verify_app.py`, `propose_stores`, `confirm_store`).
+A human confirms each Naar seller's store per marketplace → `seller_identity.json`,
+with a per-marketplace status (`confirmed` / `rejected` / `pending`).
 
-**1 · Input (`fetch_naar_products`, `iter_variants`).** Pull active products from
-the Naar products API, one row **per variant**. The Naar comparison price is the
-variant's `sellingPrice` (INR) — `price` / `priceWithoutTax` / MRP are kept as
-evidence but never coalesced into it. The seller identity we must confirm is the
-product's `seller.storeName` (brand) and `seller.businessName` (legal entity).
+**2 · Fetch** (`AmazonInAdapter`, `_scraperapi_structured`). Amazon via ScraperAPI's
+structured endpoints — parsed JSON (`pricing`, `list_price`/MRP, `sold_by`,
+availability), no HTML parsing. Flipkart/Meesho have no structured endpoint yet,
+so they're **honest stubs** that raise until a provider is wired.
 
-**2 · Search (`MarketplaceAdapter.search`).** One adapter per marketplace builds a
-query from the product title + variant signals and returns `Candidate` listings,
-each carrying its `Offer`s (the `Sold by` name and the purchasable price).
-Extraction is **structured only** — JSON-LD, Flipkart `__INITIAL_STATE__`, Meesho
-`__NEXT_DATA__` — never a regex-first-price grab.
+**3 · Product gate** (`product_gate`) → `pass` / `fail` / `borderline`:
+- **GTIN/barcode** — both expose one and match → same product; mismatch → fail.
+- **Per-unit** — a single-unit-vs-multipack (100g vs 250g) is the same product in a
+  different size: record the ratio and compare **per unit** (₹259 pack-of-5 → ₹51.8).
+- **Attributes** — colour/size must appear as whole words (`Teal` ≠ inside `Steal`).
+- **Coverage vs unexplained ratio** — a derivative (`Amla Powder Hair Mask`) is
+  dominated by unexplained tokens → borderline, never an auto-pass.
+- **LLM judge** (optional) adjudicates only the borderlines.
 
-**3 · Product gate (`product_gate`).** Per candidate → `pass` / `fail` / `borderline`:
-- **GTIN / barcode (tier 0)** — if both sides expose a barcode, an exact match is
-  the same product (deterministic, no fuzzy title); a mismatch is a hard `fail`.
-- **Per-unit normalization** — a single-unit-vs-multipack (or 100g vs 250g) is the
-  **same product in a different size**, not a mismatch: the gate records the
-  quantity ratio and the price is compared **per Naar unit** (a ₹259 pack-of-5 →
-  ₹51.8/unit vs Naar's ₹56). Only bails when sizes aren't comparable (stated on one
-  side) or the ratio is implausible.
-- **Variant attributes** (colour, numeric size) must appear as whole words in the
-  title (`Teal` ≠ inside `Steal`; `8` ≠ inside `18`).
-- **Coverage vs unexplained ratio** — how much of the Naar identity the listing
-  contains, and how much of the listing Naar can't explain. A derivative
-  (`Amla Powder Hair Mask` vs `Amla Powder`) is dominated by unexplained tokens →
-  `borderline`, never an auto-pass. Fuzzy similarity only *ranks*; it never *proves*.
-- Optional **LLM judge** adjudicates only the borderlines (never sets price/seller).
+**4 · Store filter + decision** (`compare_variant`, `_offer_matches_store`). The
+seller is already human-verified, so a `MATCHED` = the **confirmed store** is
+selling this product (matched by seller-URL token, else by `sold_by` name). Only
+the confirmed store's offers can match; any other seller of the same product is
+recorded as `other_sellers` **competitive intel** — never our match.
 
-**4 · Seller gate (`seller_gate`) — confirm the seller even under a *different* name.**
-A seller can rebrand freely, but their tax id, registered legal name, and onboarded
-store URL don't change. The gate resolves identity in tiers, hardest signal first:
-
-| Tier | Signal | Verdict |
-|------|--------|---------|
-| 1 | **GSTIN** exact (unique govt tax id) | `MATCH` — same GSTIN ⇒ same seller, any brand name; different GSTIN ⇒ `OTHER` |
-| 2 | **Seller-provided store URL** == the listing's seller link | `MATCH` |
-| 3 | Registered **legal name** exact / token-set (`PVT LTD`==`PRIVATE LIMITED`, reordering) | `MATCH` |
-| 4 | Name **similarity** only | `AMBIGUOUS` proposal — never upgraded |
-
-Only tiers 1–3 (hard identifiers) become a `MATCH`; soft name similarity stays
-`AMBIGUOUS` for review — so **recall on renamed sellers goes up without faking a
-match**. Two inputs feed this:
-
-- **Onboarding map — the reliable source.** `poc/seller_identity.json` (see
-  `seller_identity.example.json`, gitignored): per-seller `gstin` / `businessName` /
-  `brand` / `pincode` / `<marketplace>_url`. **Naar already holds this** in its seller
-  onboarding / KYC records (every seller provided GSTIN + legal entity to sell on
-  Naar), so this is a database export, not a manual lookup. Merged via
-  `resolve_naar_seller()`.
-- **Marketplace seller-profile scrape — best-effort only.** `SELLER_PROFILE_LOOKUP=1`
-  makes the Amazon adapter capture the seller-profile link and try to read the legal
-  name + GSTIN. In practice **Amazon gates the seller-info page** (it 404s on direct
-  access and hides GST behind interaction), so treat this as opportunistic — a miss
-  just leaves the row `AMBIGUOUS`. **Don't rely on it; drive matching from the
-  onboarding map above.**
-
-**5 · Decision → status.** Verdicts are collected across **all** matched
-candidates/offers, then one status is chosen (see legend below). The cheapest
-in-stock offer from the matched seller wins a `MATCHED`.
-
-**Price integrity (the cardinal rule).** A marketplace price is recorded **only**
-on `MATCHED`, and only from the matched seller's structured offer — never a guessed
-price, a homepage/catalogue-minimum figure, or a query-as-title self-match. A
-variant with no `sellingPrice` is skipped, never recorded as ₹0.
-
-### Status legend
+### Statuses
 | Status | Meaning |
 |--------|---------|
-| `MATCHED` | same product **and** same seller, in stock — real price + Δ recorded |
-| `SOLD_BY_OTHER` | product found, but every identifiable offer is a different seller |
-| `AMBIGUOUS_MATCH` | product only borderline, or seller hidden / near-miss — not confident |
-| `PRODUCT_NOT_FOUND` | no candidate is the same product |
-| `OUT_OF_STOCK` | same seller + product, but not purchasable |
-| `SOURCE_ERROR` | fetch/parse failed, or seller matched but price couldn't be extracted |
+| `MATCHED` | confirmed store sells the same product, in stock — price + Δ recorded |
+| `PRODUCT_NOT_FOUND` | not the same product, or the confirmed store isn't selling it (competitors noted) |
+| `OUT_OF_STOCK` | confirmed store + product, not purchasable |
+| `SOURCE_ERROR` | fetch failed, or matched but price unextractable |
+| *(needs review)* | store not verified yet — skipped, no fetch (stderr) |
+
+**Price integrity:** a price is written **only** on `MATCHED`, from the verified
+store's structured offer. `Record.__post_init__` nulls the price fields on every
+non-MATCHED row; competitor prices live in `other_sellers`.
 
 ---
 
-## Fetch backends
-
-`_http_get` picks a backend in this order:
-
-1. **Selenium** — `USE_SELENIUM=1`. A real headless Chrome (undetected-chromedriver
-   when available) that renders JS and evades basic bot checks. **No per-request
-   cost** — the free alternative to ScraperAPI. Rebuilds a dead browser session
-   once, and treats a redirect to a sign-in/captcha/error page as an honest block.
-2. **ScraperAPI** — `SCRAPERAPI_KEY` set (used for meesho.com, or every host with
-   `SCRAPERAPI_ALL=1`).
-3. **Plain requests** — default; fine only for non-bot-walled pages.
-
-**Measured (live, headless Selenium, no ScraperAPI):**
-
-| Marketplace | Result |
-|-------------|--------|
-| Amazon.in | ✅ full search page, ~60 product cards |
-| Flipkart | ✅ full search page, `/p/` links + JSON-LD |
-| Meesho | ⛔ Akamai **Access Denied** — needs a residential proxy or ScraperAPI |
-
-Fetching is only half the job: a low *match* rate is the gate being deliberately
-strict (correctness over coverage), not a fetch problem — expect **high precision,
-lower recall** regardless of backend. In a live 15-product sample, matches came
-only from a seller who genuinely also sells on Amazon; the rest were honestly
-`PRODUCT_NOT_FOUND` / `SOLD_BY_OTHER`.
-
----
-
-## Borderline LLM judge (optional)
-
-Rules only on product-gate *borderlines* — never sets a price or seller, returns
-`None` on any failure (gate stays honestly borderline). Listing text is treated as
-untrusted data (prompt-injection-resistant).
-
-`LLM_JUDGE_PROVIDER=anthropic|openai` (default: auto by whichever key is set).
-`openai` drives **any** OpenAI-compatible vendor via `OPENAI_BASE_URL` (OpenAI /
-Qwen / DeepSeek / Groq / OpenRouter / local Ollama).
-
----
-
-## Environment variables
-
-| Var | Default | Purpose |
-|-----|---------|---------|
-| `USE_SELENIUM` | off | route fetches through headless Chrome (free) |
-| `SELENIUM_HEADFUL` | off | show the browser window (often bypasses more walls) |
-| `SELENIUM_WAIT_MS` | `4000` | JS settle time per page |
-| `SELENIUM_UC` | `1` | prefer undetected-chromedriver (`0` = stock Selenium) |
-| `SCRAPERAPI_KEY` | — | managed scraper; required for Meesho |
-| `SCRAPERAPI_ALL` | off | route every host through ScraperAPI |
-| `SCRAPERAPI_RENDER` | off | JS render on the ScraperAPI path |
-| `LLM_JUDGE_PROVIDER` | auto | `anthropic` \| `openai` |
-| `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` | — / `claude-haiku-4-5` | Anthropic judge |
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` | — / `https://api.openai.com/v1` / `gpt-4o-mini` | OpenAI-compatible judge |
-| `SELLER_PROFILE_LOOKUP` | off | fetch the marketplace seller-profile page to read legal name + GSTIN (confirms renamed sellers) |
-| `NAAR_KYC_FILE` | `poc/seller_identity.json` | path to the seller KYC export (GSTIN / legal name / store URLs / `not_on`) |
-| `NAAR_API_KEY` | — | optional `X-Api-Key` for the Naar API |
-| `MATCH_COVERAGE_FAIL` / `MATCH_COVERAGE_PASS` / `MATCH_MAX_UNEXPLAINED_RATIO` | `0.35` / `0.6` / `0.45` | product-gate tuning knobs |
-
----
-
-## Outputs
-
-A run writes to `--out` (default `poc_out/`):
-- **`results.csv`** and **`results.jsonl`** — one record per **variant × marketplace**,
-  with the Naar price, the marketplace price (only on `MATCHED`), sold-by / legal
-  name, listing URL, match method + evidence, confidence, and timestamp.
-- A **per-platform status split** is printed to stdout.
-
----
-
-## Store verification (store-first workflow)
-
-Store names differ across platforms and can't be reliably auto-matched, so the
-robust flow is **verify each seller's store once (with a human), then look up
-products only inside that verified store.** A confirmed store gives 100% seller
-confidence before any price is recorded.
-
-1. **Verify stores** — run the standalone tool and confirm each seller's store:
-   ```bash
-   python poc/verify_app.py            # live Naar sellers   (--fixture for offline demo)
-   # open http://127.0.0.1:8765
-   ```
-   For each seller × marketplace it **auto-proposes** candidate stores (searches by
-   the store/brand name, lists the distinct sellers behind the results ranked by
-   name similarity). You **Confirm** one, **paste** the correct store URL, or mark
-   **Not on** that marketplace. Choices are written to `poc/seller_identity.json`
-   (the store registry, gitignored) with a per-marketplace status
-   (`confirmed` / `rejected` / `pending`).
-2. **Run store-first** — only verified stores are looked up:
-   ```bash
-   SCRAPERAPI_STRUCTURED=1 python poc/naar_price_poc.py --backend direct \
-     --store-first --marketplaces amazon_in flipkart meesho
-   ```
-   Per seller × marketplace: **confirmed** → search the product and keep only offers
-   **from the confirmed store** (the store filter replaces the fuzzy seller gate),
-   then product gate + per-unit price; **rejected** → skip; **pending** → reported as
-   *needs review* (no fetch). Reuses the existing registry (`seller_identity.json`),
-   `seller_present_on`, and the store-URL seller tier.
+## Environment (`poc/.env`, gitignored, loaded by `_load_dotenv`)
+| Var | Purpose |
+|-----|---------|
+| `SCRAPERAPI_KEY` | ScraperAPI structured endpoints (Amazon fetch + store proposals) |
+| `LLM_JUDGE_PROVIDER` | `anthropic` \| `openai` (default: auto by which key is set) |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` | Anthropic judge |
+| `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL` | any OpenAI-compatible judge |
+| `NAAR_KYC_FILE` | store-registry path (default `poc/seller_identity.json`) |
+| `MATCH_COVERAGE_FAIL` / `MATCH_COVERAGE_PASS` / `MATCH_MAX_UNEXPLAINED_RATIO` | product-gate tuning |
 
 ---
 
 ## Files
-
 | File | What it is |
 |------|-----------|
-| `naar_price_poc.py` | The POC — Naar API pull, per-marketplace adapters, product + seller gates, six honest statuses, fetch backends, optional judge. Ships `--self-test`. |
-| `eval_accuracy.py` | Labeled accuracy harness over the matcher (offline). Reports status accuracy + the cardinal metric: **MATCHED precision / zero false matches**. |
-| `prove_llm.py` | End-to-end proof of the provider-agnostic judge against a local mock OpenAI-compatible server (no secrets, no network). |
-| `live_judge.py` | Live smoke test of the judge against a real vendor; provider/keys from env, prints only verdicts. |
-| `verify_app.py` | Standalone store-verification tool (stdlib web app). Auto-proposes candidate marketplace stores per Naar seller; you confirm / reject / paste a URL. Curates the store registry `seller_identity.json` that drives `--store-first`. |
-| `seller_identity.example.json` | Template for the per-seller onboarding map (`gstin` / legal name / store URLs) that confirms a seller under a different marketplace name. Copy to `seller_identity.json` (gitignored). |
-
----
+| `naar_price_poc.py` | The POC — Naar pull, structured Amazon adapter, product gate, store-first match, per-unit price, optional judge, six honest statuses. Ships `--self-test`. |
+| `verify_app.py` | Store-verification web tool: auto-proposes stores, Confirm/Reject/Paste-URL, writes the registry. |
+| `eval_accuracy.py` | Labeled harness — the cardinal metric: **MATCHED precision / zero false matches**. |
+| `prove_llm.py` | Judge proof against a local mock OpenAI-compatible server (no secrets, no network). |
+| `live_judge.py` | Live judge smoke test; provider/keys from env. |
+| `make_sheet.py` | Turns a run into a shareable CSV (Excel/Sheets). |
+| `seller_identity.example.json` | Store-registry template (copy to `seller_identity.json`, gitignored). |
 
 ## Scope & caveats
-
-- Accuracy proven here is **matching-logic** precision on a labeled set + a small
-  live sample — not full end-to-end real-marketplace accuracy at scale.
-- Direct scraping of Amazon/Flipkart/Meesho carries **ToS/legal** considerations;
-  Meesho specifically is behind Akamai and needs a compliant managed provider.
-- Match rate is bounded by **seller presence** — if Naar's seller isn't on the
-  marketplace under the same identity, no correct `MATCHED` exists, and the tool
-  says so (`SOLD_BY_OTHER` / `AMBIGUOUS`) rather than inventing one.
+- Live fetch is **Amazon-only** today (the one marketplace with a structured
+  endpoint); Flipkart/Meesho need a structured provider wired to their stubs.
+- Structured API is **paid** (ScraperAPI credits) — the reliable path at scale.
+- Coverage is bounded by **store verification + product/seller presence**: the tool
+  reports the truth (`PRODUCT_NOT_FOUND`, competitor intel) rather than faking a match.

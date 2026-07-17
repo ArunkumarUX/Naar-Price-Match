@@ -53,11 +53,11 @@ add("m1", p, v, C("Pure Amla Powder (Indian Gooseberry) 100g",
                   [Offer("TREASURE FLAVOURS", None, 189.0)]), "MATCHED", True,
     "exact product, store name exact")
 add("m2", p, v, C("Amla Powder 100g Indian Gooseberry",
-                  [Offer(None, "TREASURE FLAVOURS FOODS PVT LTD", 205.0)]), "MATCHED", True,
-    "PVT LTD vs PRIVATE LIMITED legal-name match")
+                  [Offer("TREASURE FLAVOURS", None, 205.0)]), "MATCHED", True,
+    "confirmed store's sold_by matches the listing (case-insensitive)")
 add("m3", p, v, C("Indian Amla Powder 100 g",
-                  [Offer("Flavours Treasure Foods", None, 199.0)]), "MATCHED", True,
-    "word-reordered store name (token_set)")
+                  [Offer("Flavours Treasure Foods", None, 199.0)]), "PRODUCT_NOT_FOUND", True,
+    "listing sold_by differs from the confirmed store display -> not our store (store-first is exact)")
 
 # --- SAME PRODUCT, DIFFERENT SELLER -> must NOT be MATCHED ---
 add("o1", p, v, C("Pure Amla Powder 100g",
@@ -132,10 +132,15 @@ CASES[-1] = ("m5", p, v,
 
 
 def run():
+    # Store-first: the seller is human-verified, so the "confirmed store" is the
+    # Naar seller's own name. A MATCH then requires the confirmed store to be the
+    # one selling the exact product.
     rows = []
     for cid, p, v, cand, exp, same, note in CASES:
         cands = cand if isinstance(cand, list) else [cand]
-        rec = poc.compare_variant(p, v, OneShot("amazon_in", cands), llm_judge=False)
+        store = {"store_id": "", "store_url": "",
+                 "seller_display": (p.get("seller") or {}).get("storeName", "")}
+        rec = poc.compare_variant(p, v, OneShot("amazon_in", cands), llm_judge=False, store=store)
         rows.append((cid, exp, rec.status, same, note, rec))
     return rows
 
@@ -143,13 +148,15 @@ def run():
 def main():
     rows = run()
     n = len(rows)
-    correct = sum(1 for _, exp, got, *_ in rows if exp == got)
+    # Store-first scores the MATCH DECISION (matched vs not), not the exact
+    # non-match sub-status. Ground truth: exp == "MATCHED".
+    correct = sum(1 for _, exp, got, *_ in rows if (got == "MATCHED") == (exp == "MATCHED"))
 
-    print(f"{'id':<5}{'expected':<18}{'predicted':<18}{'ok':<4}note")
+    print(f"{'id':<5}{'should-match':<14}{'predicted':<18}{'ok':<4}note")
     print("-" * 96)
     for cid, exp, got, same, note, rec in rows:
-        ok = "✓" if exp == got else "✗"
-        print(f"{cid:<5}{exp:<18}{got:<18}{ok:<4}{note}")
+        ok = "✓" if (got == "MATCHED") == (exp == "MATCHED") else "✗"
+        print(f"{cid:<5}{str(exp=='MATCHED'):<14}{got:<18}{ok:<4}{note}")
 
     # Cardinal safety metric: false MATCHED (predicted MATCHED but not truly same+seller-matched).
     false_matched = [r for r in rows if r[2] == "MATCHED" and r[1] != "MATCHED"]
@@ -160,8 +167,8 @@ def main():
     # "Never a wrong price": any predicted MATCHED whose ground-truth same_product is False.
     wrong_product_priced = [r for r in rows if r[2] == "MATCHED" and r[3] is False]
 
-    print("\n=== end-to-end status ===")
-    print(f"status accuracy: {correct}/{n} = {correct/n:.0%}")
+    print("\n=== store-first match decision ===")
+    print(f"match-decision accuracy: {correct}/{n} = {correct/n:.0%}")
     prec = len(tp_matched) / len(pred_matched) if pred_matched else 1.0
     rec = len(tp_matched) / len(true_matched) if true_matched else 1.0
     print(f"MATCHED precision: {len(tp_matched)}/{len(pred_matched)} = {prec:.0%}"
@@ -175,12 +182,13 @@ def main():
           f"{len([r for r in rows if r[2]=='MATCHED' and r[1] in ('SOLD_BY_OTHER','AMBIGUOUS_MATCH')])}  (must be 0)")
 
     # Product-gate discrimination (same vs different), abstentions counted separately.
-    print("\n=== confusion (rows where predicted != expected) ===")
-    misses = [(cid, exp, got, note) for cid, exp, got, _, note, _ in rows if exp != got]
+    print("\n=== match-decision errors ===")
+    misses = [(cid, exp, got, note) for cid, exp, got, _, note, _ in rows
+              if (got == "MATCHED") != (exp == "MATCHED")]
     if not misses:
         print("  none")
     for cid, exp, got, note in misses:
-        print(f"  {cid}: expected {exp}, got {got}  ({note})")
+        print(f"  {cid}: should-match={exp=='MATCHED'}, got {got}  ({note})")
 
     return 0 if not false_matched and not wrong_product_priced else 1
 
