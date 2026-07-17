@@ -55,6 +55,7 @@ SCRAPERAPI_KEY=... python poc/naar_price_poc.py --backend direct --limit 10 \
 | `--marketplaces` | `amazon_in flipkart` | subset of `amazon_in flipkart meesho` |
 | `--llm-judge` | off | use an LLM to adjudicate *borderline* product pairs |
 | `--strict` | off | any unexplained candidate token demotes to borderline |
+| `--store-first` | off | only look up products inside **human-verified** stores (see below) |
 | `--self-test` | — | run regression checks and exit |
 | `--out` | `poc_out` | output directory |
 
@@ -236,6 +237,37 @@ A run writes to `--out` (default `poc_out/`):
 
 ---
 
+## Store verification (store-first workflow)
+
+Store names differ across platforms and can't be reliably auto-matched, so the
+robust flow is **verify each seller's store once (with a human), then look up
+products only inside that verified store.** A confirmed store gives 100% seller
+confidence before any price is recorded.
+
+1. **Verify stores** — run the standalone tool and confirm each seller's store:
+   ```bash
+   python poc/verify_app.py            # live Naar sellers   (--fixture for offline demo)
+   # open http://127.0.0.1:8765
+   ```
+   For each seller × marketplace it **auto-proposes** candidate stores (searches by
+   the store/brand name, lists the distinct sellers behind the results ranked by
+   name similarity). You **Confirm** one, **paste** the correct store URL, or mark
+   **Not on** that marketplace. Choices are written to `poc/seller_identity.json`
+   (the store registry, gitignored) with a per-marketplace status
+   (`confirmed` / `rejected` / `pending`).
+2. **Run store-first** — only verified stores are looked up:
+   ```bash
+   SCRAPERAPI_STRUCTURED=1 python poc/naar_price_poc.py --backend direct \
+     --store-first --marketplaces amazon_in flipkart meesho
+   ```
+   Per seller × marketplace: **confirmed** → search the product and keep only offers
+   **from the confirmed store** (the store filter replaces the fuzzy seller gate),
+   then product gate + per-unit price; **rejected** → skip; **pending** → reported as
+   *needs review* (no fetch). Reuses the existing registry (`seller_identity.json`),
+   `seller_present_on`, and the store-URL seller tier.
+
+---
+
 ## Files
 
 | File | What it is |
@@ -244,6 +276,7 @@ A run writes to `--out` (default `poc_out/`):
 | `eval_accuracy.py` | Labeled accuracy harness over the matcher (offline). Reports status accuracy + the cardinal metric: **MATCHED precision / zero false matches**. |
 | `prove_llm.py` | End-to-end proof of the provider-agnostic judge against a local mock OpenAI-compatible server (no secrets, no network). |
 | `live_judge.py` | Live smoke test of the judge against a real vendor; provider/keys from env, prints only verdicts. |
+| `verify_app.py` | Standalone store-verification tool (stdlib web app). Auto-proposes candidate marketplace stores per Naar seller; you confirm / reject / paste a URL. Curates the store registry `seller_identity.json` that drives `--store-first`. |
 | `seller_identity.example.json` | Template for the per-seller onboarding map (`gstin` / legal name / store URLs) that confirms a seller under a different marketplace name. Copy to `seller_identity.json` (gitignored). |
 
 ---

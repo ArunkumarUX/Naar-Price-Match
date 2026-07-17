@@ -299,6 +299,90 @@ def seller_present_on(marketplace: str, seller: dict) -> Optional[bool]:
     return None
 
 
+# --- Store registry writes (the human-verified store map) ------------------
+# The verification tool curates poc/seller_identity.json: a CONFIRM sets the
+# marketplace store URL (so resolve_naar_seller / seller_gate use it) and a
+# REJECT records the marketplace in `not_on` (so seller_present_on skips it).
+
+def _registry_path() -> "os.PathLike":
+    import pathlib
+    env_path = os.environ.get("NAAR_KYC_FILE", "").strip()
+    return pathlib.Path(env_path) if env_path else \
+        pathlib.Path(__file__).resolve().parent / "seller_identity.json"
+
+
+def _load_registry_file() -> dict:
+    try:
+        return json.loads(_registry_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_registry_file(data: dict) -> None:
+    global _seller_identity_cache
+    _registry_path().write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    _seller_identity_cache = None            # bust the read cache so changes take effect
+
+
+def _now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def confirm_store(seller_id: str, marketplace: str, store_url: str = "",
+                  seller_display: str = "") -> dict:
+    """Human confirmed the seller's store on `marketplace`. Records the store URL
+    when known (used by resolve_naar_seller / seller_gate) and/or the confirmed
+    'Sold by' name (structured API exposes the name, not a URL) + audit status;
+    clears any prior rejection. At least one of store_url / seller_display required."""
+    store_url = (store_url or "").strip()
+    seller_display = (seller_display or "").strip()
+    if not store_url and not seller_display:
+        raise ValueError("confirm_store needs a store_url or a seller_display")
+    data = _load_registry_file()
+    entry = data.setdefault(str(seller_id), {})
+    if store_url:
+        entry[f"{marketplace}_url"] = store_url
+    if isinstance(entry.get("not_on"), list) and marketplace in entry["not_on"]:
+        entry["not_on"] = [m for m in entry["not_on"] if m != marketplace]
+    entry.setdefault("stores", {})[marketplace] = {
+        "store_id": _seller_id_from_url(store_url),
+        "store_url": store_url,
+        "seller_display": seller_display,
+        "status": "confirmed",
+        "verified_at": _now_iso(),
+    }
+    _save_registry_file(data)
+    return entry
+
+
+def reject_store(seller_id: str, marketplace: str) -> dict:
+    """Human confirmed the seller is NOT on `marketplace` (or the proposal was
+    wrong). Records it in `not_on` so the pipeline skips it, drops any store URL."""
+    data = _load_registry_file()
+    entry = data.setdefault(str(seller_id), {})
+    entry.pop(f"{marketplace}_url", None)
+    not_on = entry.setdefault("not_on", [])
+    if marketplace not in not_on:
+        not_on.append(marketplace)
+    entry.setdefault("stores", {})[marketplace] = {
+        "status": "rejected", "verified_at": _now_iso()}
+    _save_registry_file(data)
+    return entry
+
+
+def store_status(seller_id: str, marketplace: str) -> str:
+    """'confirmed' | 'rejected' | 'pending' for a seller×marketplace, from the registry."""
+    entry = load_seller_identities().get(str(seller_id), {})
+    st = (entry.get("stores") or {}).get(marketplace, {}).get("status")
+    if st in ("confirmed", "rejected"):
+        return st
+    if entry.get(f"{marketplace}_url"):
+        return "confirmed"
+    if marketplace in (entry.get("not_on") or []):
+        return "rejected"
+    return "pending"
+
+
 def content_tokens(s: str) -> set[str]:
     # Quantity expressions ("100g", "100 g") are handled by their own gate;
     # stripping them here stops spacing artefacts ("g") polluting the
@@ -1603,11 +1687,71 @@ def seller_gate(naar_seller: dict, offer: Offer) -> tuple[str, float, str]:
 
 
 # --------------------------------------------------------------------------
+# Store-first: propose candidate stores + match offers to a confirmed store
+# --------------------------------------------------------------------------
+
+def _confirmed_store(seller_id: str, marketplace: str) -> Optional[dict]:
+    """The human-confirmed store identity {store_id, store_url, seller_display}
+    for a seller×marketplace, or None if not confirmed."""
+    entry = load_seller_identities().get(str(seller_id), {})
+    st = (entry.get("stores") or {}).get(marketplace)
+    if st and st.get("status") == "confirmed":
+        return st
+    url = entry.get(f"{marketplace}_url")
+    if url:
+        return {"store_id": _seller_id_from_url(url), "store_url": url, "seller_display": ""}
+    return None
+
+
+def _offer_matches_store(offer: Offer, store: dict) -> bool:
+    """Is this marketplace offer from the confirmed store? Matches by seller-URL
+    token when both have one, else by the confirmed 'Sold by' name (exact/token-set)."""
+    sid = store.get("store_id") or _seller_id_from_url(store.get("store_url"))
+    if sid and _seller_id_from_url(offer.seller_url) == sid:
+        return True
+    disp = store.get("seller_display") or ""
+    if disp and offer.seller_display:
+        _, exactness = name_compare(offer.seller_display, disp)
+        return exactness is not None            # exact / token_set only
+    return False
+
+
+def propose_stores(seller_name: str, marketplace: str, adapter: MarketplaceAdapter,
+                   max_candidates: int = 5) -> list[dict]:
+    """Auto-propose candidate marketplace stores for a Naar seller: search by the
+    seller/brand name, collect the DISTINCT sellers behind the results, ranked by
+    name similarity. The human confirms one (or pastes a URL)."""
+    try:
+        cands = adapter.search(seller_name)
+    except SourceError as e:
+        return [{"error": str(e)}]
+    seen: dict[str, dict] = {}
+    for c in cands:
+        for o in (c.offers or []):
+            if not o.seller_display:
+                continue
+            key = _seller_id_from_url(o.seller_url) or norm_name(o.seller_display)
+            if not key or key in seen:
+                continue
+            sim, _ = name_compare(o.seller_display, seller_name)
+            seen[key] = {
+                "store_id": _seller_id_from_url(o.seller_url),
+                "store_url": o.seller_url or "",
+                "seller_display": o.seller_display,
+                "sample_title": c.title,
+                "sample_listing": c.listing_url,
+                "similarity": round(sim, 3),
+            }
+    return sorted(seen.values(), key=lambda x: -x["similarity"])[:max_candidates]
+
+
+# --------------------------------------------------------------------------
 # Pipeline
 # --------------------------------------------------------------------------
 
 def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
-                    llm_judge: bool, strict: bool = False) -> Record:
+                    llm_judge: bool, strict: bool = False,
+                    store: Optional[dict] = None) -> Record:
     if variant.get("sellingPrice") in (None, ""):
         # Fix 5 (defence in depth): never coerce a missing Naar price to 0.0.
         raise ValueError(f"variant {variant.get('_id')!r} has no sellingPrice; "
@@ -1616,9 +1760,9 @@ def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
     # Meesho SERP quality improves sharply when the Naar store/brand is in the
     # query; Amazon/Flipkart already rank brand tokens from the title alone.
     if adapter.name == "meesho":
-        store = ((product.get("seller") or {}).get("storeName") or "").strip()
-        if store and store.casefold() not in query.casefold():
-            query = f"{store} {query}"
+        store_name = ((product.get("seller") or {}).get("storeName") or "").strip()
+        if store_name and store_name.casefold() not in query.casefold():
+            query = f"{store_name} {query}"
     base = dict(naar_product_id=product.get("_id", ""),
                 naar_variant_id=variant.get("_id", ""),
                 naar_seller_id=product.get("sellerId", ""),
@@ -1660,6 +1804,13 @@ def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
 
     for cand, pevidence in product_matched:
         for offer in cand.offers or [Offer(None)]:
+            # Store-first mode: the seller is already human-verified, so we only
+            # keep offers FROM the confirmed store — the store filter replaces the
+            # fuzzy seller gate. Anything else on the listing is ignored.
+            if store is not None:
+                if _offer_matches_store(offer, store):
+                    matched_offers.append((cand, offer, 1.0, "store_confirmed", pevidence))
+                continue
             verdict, conf, signal = seller_gate(seller, offer)
             if verdict == "MATCH":
                 matched_offers.append((cand, offer, conf, signal, pevidence))
@@ -1686,6 +1837,14 @@ def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
     def _unit_of(t) -> float:
         up = per_unit_price(t[1].price_inr, _ratio(t[0]))
         return up if up is not None else t[1].price_inr
+
+    # Store-first: product is on the marketplace but the confirmed store isn't
+    # the one selling it here -> not found in THEIR store (not an ambiguous seller).
+    if store is not None and not matched_offers and not offers_failed:
+        return Record(**base, status="PRODUCT_NOT_FOUND",
+                      product_match_method="attribute_gate",
+                      seller_match_signal="store_confirmed",
+                      match_evidence="product on marketplace but not sold by the confirmed store")
 
     if matched_offers:
         purchasable = [t for t in matched_offers if t[1].in_stock and t[1].price_inr is not None]
@@ -1795,15 +1954,27 @@ def run(args) -> list[Record]:
                       file=sys.stderr)
                 continue
             for m, adapter in adapters.items():
-                # Seller-presence-first: if KYC says this seller isn't on this
-                # marketplace, skip — no wasted fetch (the elegant efficiency win).
-                if seller_present_on(m, resolve_naar_seller(product, m)) is False:
-                    print(f"[SKIPPED (not on {m})] {product.get('title','')[:30]:<30} "
-                          f"— seller not on {m} per KYC", file=sys.stderr)
+                store = None
+                title30 = product.get("title", "")[:30]
+                if getattr(args, "store_first", False):
+                    # Store-first: only look up products inside a HUMAN-VERIFIED store.
+                    st = store_status(product.get("sellerId", ""), m)
+                    if st == "rejected":
+                        print(f"[SKIPPED (not on {m})] {title30:<30} — store rejected", file=sys.stderr)
+                        continue
+                    if st != "confirmed":
+                        print(f"[NEEDS REVIEW ({m})] {title30:<30} — store not verified yet",
+                              file=sys.stderr)
+                        continue
+                    store = _confirmed_store(product.get("sellerId", ""), m)
+                elif seller_present_on(m, resolve_naar_seller(product, m)) is False:
+                    # Seller-presence-first: KYC says the seller isn't here -> skip, no fetch.
+                    print(f"[SKIPPED (not on {m})] {title30:<30} — seller not on {m} per KYC",
+                          file=sys.stderr)
                     continue
                 if isinstance(adapter, FixtureAdapter):
                     adapter.bind(product.get("_id", ""))
-                rec = compare_variant(product, variant, adapter, args.llm_judge, args.strict)
+                rec = compare_variant(product, variant, adapter, args.llm_judge, args.strict, store=store)
                 records.append(rec)
                 delta = ""
                 if rec.status == "MATCHED":
@@ -2098,6 +2269,73 @@ def self_test() -> int:
             if v is not None:
                 os.environ[k] = v
 
+    # 13. Store-first: registry writes, store matching, proposer, store-scoped lookup.
+    import tempfile as _tf
+    _saved_kyc = os.environ.get("NAAR_KYC_FILE")
+    _fd, _reg = _tf.mkstemp(suffix=".json")
+    os.close(_fd)
+    os.environ["NAAR_KYC_FILE"] = _reg
+    global _seller_identity_cache
+    _seller_identity_cache = None
+    try:
+        confirm_store("s1", "amazon_in", seller_display="Nivarana")   # name-only (structured API)
+        check("confirm_store(name) -> status confirmed", store_status("s1", "amazon_in") == "confirmed")
+        confirm_store("s2", "amazon_in", store_url="https://www.amazon.in/sp?seller=A1B2C3D4E5")
+        check("confirm_store(url) -> _confirmed_store carries store_id",
+              _confirmed_store("s2", "amazon_in")["store_id"] == "amazon:A1B2C3D4E5")
+        reject_store("s3", "meesho")
+        check("reject_store -> rejected + seller skipped",
+              store_status("s3", "meesho") == "rejected"
+              and seller_present_on("meesho", resolve_naar_seller({"sellerId": "s3"}, "meesho")) is False)
+        store = _confirmed_store("s1", "amazon_in")
+        check("offer matches confirmed store by 'Sold by' name",
+              _offer_matches_store(Offer("Nivarana", price_inr=515.0), store)
+              and not _offer_matches_store(Offer("Someone Else"), store))
+
+        class _PropStub(MarketplaceAdapter):
+            name = "amazon_in"
+            def search(self, q):
+                return [Candidate("amazon_in", "A", "u", "X", [Offer("Nivarana", price_inr=1.0)]),
+                        Candidate("amazon_in", "B", "u", "X", [Offer("Nivarana", price_inr=2.0)]),
+                        Candidate("amazon_in", "C", "u", "X", [Offer("HealthKart", price_inr=3.0)])]
+        props = propose_stores("Nivarana", "amazon_in", _PropStub())
+        check("propose_stores dedups sellers and ranks by name similarity",
+              len(props) == 2 and props[0]["seller_display"] == "Nivarana" and props[0]["similarity"] == 1.0)
+
+        # store-first compare: only the confirmed store's offer counts; buy-box other-seller ignored.
+        prod = {"_id": "p", "title": "Amla Powder", "description": "Pure amla powder 100g",
+                "sellerId": "s1", "seller": {"storeName": "Nivarana"}}
+        pv = {"_id": "v", "attributes": {"weight": "100g"}, "variantName": "100g", "sellingPrice": 90.0}
+
+        class _StoreStub(MarketplaceAdapter):
+            name = "amazon_in"
+            def search(self, q):
+                return [Candidate("amazon_in", "L", "u", "Amla Powder 100g",
+                                  [Offer("RetailNet", price_inr=120.0),
+                                   Offer("Nivarana", price_inr=99.0)])]
+        rec = compare_variant(prod, pv, _StoreStub(), False, store=store)
+        check("store-first MATCHES the confirmed store's offer, ignores the buy-box seller",
+              rec.status == "MATCHED" and rec.marketplace_selling_price == 99.0
+              and rec.marketplace_sold_by == "Nivarana")
+        # product on marketplace but confirmed store isn't selling it -> not found in their store
+        class _NoStoreStub(MarketplaceAdapter):
+            name = "amazon_in"
+            def search(self, q):
+                return [Candidate("amazon_in", "L", "u", "Amla Powder 100g",
+                                  [Offer("RetailNet", price_inr=120.0)])]
+        rec = compare_variant(prod, pv, _NoStoreStub(), False, store=store)
+        check("store-first: product present but not sold by the confirmed store -> PRODUCT_NOT_FOUND",
+              rec.status == "PRODUCT_NOT_FOUND")
+    finally:
+        _seller_identity_cache = None
+        os.environ.pop("NAAR_KYC_FILE", None)
+        if _saved_kyc is not None:
+            os.environ["NAAR_KYC_FILE"] = _saved_kyc
+        try:
+            os.remove(_reg)
+        except OSError:
+            pass
+
     print(f"\n{len(failures)} failure(s)" if failures else "\nAll checks passed.")
     return 1 if failures else 0
 
@@ -2140,6 +2378,9 @@ def main():
                     help="use an LLM for borderline product pairs (ANTHROPIC_API_KEY)")
     ap.add_argument("--strict", action="store_true",
                     help="any unexplained candidate token demotes to borderline")
+    ap.add_argument("--store-first", action="store_true",
+                    help="only look up products inside human-verified stores "
+                         "(seller_identity.json); confirm via verify_app.py")
     ap.add_argument("--self-test", action="store_true",
                     help="run the review regression checks and exit")
     ap.add_argument("--out", default="poc_out")
