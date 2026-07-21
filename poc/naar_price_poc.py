@@ -629,6 +629,53 @@ class AmazonInAdapter(MarketplaceAdapter):
                 c.offers, c.offers_error = [], str(e)
         return cands
 
+    def discover_stores(self, brand: str, scan: int = 40, max_fetch: int = 8) -> list[dict]:
+        """Store discovery for verify_app. Two facts break naive top-5 sold_by
+        matching: (1) the store's marketplace 'Sold by' name often DIFFERS from the
+        Naar/brand name ('Sirpika Millets' -> sold by 'SIRPIKA FOODS'); (2) the
+        brand's own listings routinely rank well below the first 5 results. But the
+        BRAND appears in the product TITLE. So anchor on the brand tokens in the
+        title (scan deep), then read who actually SELLS those products, and surface
+        those sellers — ranked by how many of the brand's listings they carry — for
+        the human to confirm."""
+        toks = content_tokens(brand) or {w for w in norm_name(brand).split() if len(w) > 1}
+        if not toks:
+            return []
+        results = _scraperapi_structured("amazon/search", {"query": brand}).get("results")
+        if not isinstance(results, list):
+            return []
+        hits: list[tuple[str, str]] = []
+        seen_asin: set[str] = set()
+        for r in results[:scan]:
+            if not isinstance(r, dict):
+                continue
+            asin = str(r.get("asin") or "").strip()
+            title = r.get("name") or r.get("title") or ""
+            if asin and asin not in seen_asin and all(t in title.casefold() for t in toks):
+                seen_asin.add(asin)
+                hits.append((asin, title))
+        stores: dict[str, dict] = {}
+        for asin, title in hits[:max_fetch]:
+            try:
+                off = _amazon_structured_offer(
+                    _scraperapi_structured("amazon/product", {"asin": asin}), asin)
+            except SourceError:
+                continue
+            if not off.seller_display:
+                continue
+            key = _seller_id_from_url(off.seller_url) or norm_name(off.seller_display)
+            store = stores.setdefault(key, {
+                "store_id": _seller_id_from_url(off.seller_url),
+                "store_url": off.seller_url or "",
+                "seller_display": off.seller_display,
+                "sample_title": title,
+                "sample_listing": f"https://www.amazon.in/dp/{asin}",
+                "similarity": round(name_compare(off.seller_display, brand)[0], 3),
+                "n_products": 0,
+            })
+            store["n_products"] += 1
+        return sorted(stores.values(), key=lambda s: (-s["n_products"], -s["similarity"]))
+
 
 class _UnsupportedAdapter(MarketplaceAdapter):
     """Marketplaces with no structured-data endpoint yet. Honest by design: it
@@ -976,9 +1023,18 @@ def _offer_matches_store(offer: Offer, store: dict) -> bool:
 
 def propose_stores(seller_name: str, marketplace: str, adapter: MarketplaceAdapter,
                    max_candidates: int = 5) -> list[dict]:
-    """Auto-propose candidate marketplace stores for a Naar seller: search by the
-    seller/brand name, collect the DISTINCT sellers behind the results, ranked by
-    name similarity. The human confirms one (or pastes a URL)."""
+    """Auto-propose candidate marketplace stores for a Naar seller for the human to
+    confirm. Prefers the adapter's deep, brand-in-title store discovery (which finds
+    the real store even when its 'Sold by' name differs from the brand); falls back
+    to collecting the distinct sellers behind a plain search."""
+    discover = getattr(adapter, "discover_stores", None)
+    if callable(discover):
+        try:
+            stores = discover(seller_name)
+        except SourceError as e:
+            return [{"error": str(e)}]
+        if stores:                                   # else fall through to the plain-search path
+            return stores[:max_candidates]
     try:
         cands = adapter.search(seller_name)
     except SourceError as e:
@@ -1324,6 +1380,45 @@ def _test_structured_api(check):
     check("structured out-of-stock / no price honest", off2.in_stock is False and off2.price_inr is None)
 
 
+def _test_store_discovery(check):
+    """Store discovery anchors on the brand-in-TITLE (deep scan), then reads the
+    real 'Sold by' — so it finds a brand whose listings rank past the top 5 and
+    whose store name DIFFERS from the brand (the 'Sirpika Millets' -> 'SIRPIKA
+    FOODS' case). Mocks the structured API; no network."""
+    import sys as _sys
+    mod = _sys.modules[__name__]
+    orig = mod._scraperapi_structured
+    search = {"results": [
+        {"asin": "U1", "name": "The Millet Company Unpolished Combo"},   # ranks 1-5: not the brand
+        {"asin": "U2", "name": "Adithi Millets Combo Pack"},
+        {"asin": "U3", "name": "Millet Amma Organic Little Millet"},
+        {"asin": "U4", "name": "Nandan Ji Millets Combo"},
+        {"asin": "U5", "name": "Generic Foxtail Millet 1kg"},
+        {"asin": "S1", "name": "Sirpika Millets Browntop (Unpolished) 500g"},   # brand, ranks >5
+        {"asin": "S2", "name": "Sirpika Millets Kodo Millets 500g"},
+        {"asin": "S3", "name": "Sirpika Millets Parboiled 500g"},
+    ]}
+    sold_by = {"S1": "SIRPIKA FOODS", "S2": "SIRPIKA FOODS", "S3": "SIRPIKA FOODS",
+               "U1": "The Millet Company", "U2": "ADITHI MILLETS"}   # U* must never be fetched
+    def fake(kind, params):
+        if kind == "amazon/search":
+            return search
+        if kind == "amazon/product":
+            return {"sold_by": sold_by.get(params["asin"], "Someone Else"),
+                    "pricing": "₹499", "availability_status": "In stock"}
+        raise SourceError("unexpected structured call")
+    mod._scraperapi_structured = fake
+    try:
+        stores = AmazonInAdapter().discover_stores("Sirpika Millets")
+        check("discovery finds the brand store past the top 5, by title (sold_by != brand)",
+              bool(stores) and stores[0]["seller_display"] == "SIRPIKA FOODS"
+              and stores[0]["n_products"] == 3)
+        check("discovery ignores unrelated top results (brand not in their title)",
+              all(s["seller_display"] == "SIRPIKA FOODS" for s in stores))
+    finally:
+        mod._scraperapi_structured = orig
+
+
 def _test_store_filter(check):
     """An offer matches ONLY the confirmed store: exact name, or a path-anchored seller-URL token."""
     perm = {"store_id": "", "store_url": "", "seller_display": "Silk House"}
@@ -1528,6 +1623,7 @@ def self_test() -> int:
     _test_quantity_and_units(check)
     _test_gtin(check)
     _test_structured_api(check)
+    _test_store_discovery(check)
     _test_store_filter(check)
     _test_price_safety(check)
     _test_llm_judge(check)

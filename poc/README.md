@@ -32,10 +32,13 @@ python poc/prove_llm.py                          # provider-agnostic judge proof
 ```bash
 python poc/verify_app.py        # open http://127.0.0.1:8765  (--fixture for offline sellers)
 ```
-For each seller it **auto-proposes** candidate stores (searches by the store/brand
-name, lists the distinct sellers behind the results ranked by similarity). You
-**Confirm** one, **paste** the correct store URL, or mark **Not on** that
-marketplace. Choices persist to `poc/seller_identity.json` (the store registry).
+For each seller it **auto-proposes** candidate stores. It searches the brand deep,
+keeps the listings whose **title** carries the brand, then reads **who actually
+sells them** — so it finds the real store even when its marketplace "Sold by" name
+differs from the Naar name (e.g. *Sirpika Millets* → sold by **SIRPIKA FOODS**) and
+even when the brand's listings rank past the first page. You **Confirm** one,
+**paste** the correct store URL, or mark **Not on** that marketplace. Choices
+persist to `poc/seller_identity.json` (the store registry).
 
 **3 · Store-first run** — only verified stores are looked up:
 ```bash

@@ -7,10 +7,13 @@ candidate marketplace stores (search by store/brand name), and the reviewer
 CONFIRMS one, pastes the correct store URL, or marks the seller "not on" the
 marketplace. Confirmed stores then drive `naar_price_poc.py --store-first`.
 
-Run:  python poc/verify_app.py           # live Naar sellers (needs network)
+Run:  python poc/verify_app.py           # live Naar sellers, whole catalogue (paged)
       python poc/verify_app.py --fixture # offline demo sellers
 Then open http://127.0.0.1:8765
+Env:  VERIFY_LIMIT=N   cap on catalogue products paged (default 5000)
+      VERIFY_PORT=N    listen port (default 8765)
 """
+import concurrent.futures
 import json
 import os
 import sys
@@ -25,6 +28,8 @@ poc._load_dotenv()
 MARKETPLACES = ("amazon_in", "flipkart", "meesho")
 USE_FIXTURE = "--fixture" in sys.argv
 _sellers_cache: list = []
+_sellers_ready = False          # set once the (paged) seller list has loaded
+_sellers_error = ""             # non-empty if the live catalogue fetch failed
 _lock = threading.Lock()
 
 
@@ -33,12 +38,53 @@ def _adapter(marketplace: str):
             "meesho": poc.MeeshoAdapter}[marketplace]()
 
 
-def load_naar_sellers(limit: int = 200) -> list:
-    """Distinct Naar sellers (id, store name, business name) from the catalogue."""
+def _fetch_page(skip: int, page_size: int, tries: int = 3):
+    """One catalogue page, retried on transient failures. Returns None if it still
+    fails after `tries` — so one flaky page can't blank the whole seller list."""
+    for attempt in range(tries):
+        try:
+            return poc.fetch_naar_products(page_size, skip)
+        except poc.SourceError as e:
+            if attempt == tries - 1:
+                print(f"[verify_app] page skip={skip} failed after {tries} tries: {e}", file=sys.stderr)
+                return None
+    return None
+
+
+def _all_naar_products() -> list:
+    """Page through the whole Naar catalogue. The API caps at ~100 products/page,
+    so a single fetch only sees page 1 (~14 sellers). The pages are independent,
+    so fetch them a batch at a time CONCURRENTLY (serial paging is ~2 min; batched
+    is ~10s), retrying transient blips, until a short/empty/failed page marks the
+    end. Partial results are kept — a mid-catalogue hiccup never blanks the UI.
+    Bounded by VERIFY_LIMIT so a mis-paginating API can't run away."""
+    cap = int(os.environ.get("VERIFY_LIMIT", "5000"))
+    page_size, batch = 100, 8
+    out: list = []
+    base = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=batch) as ex:
+        while len(out) < cap:
+            skips = [base + i * page_size for i in range(batch)]
+            pages = list(ex.map(lambda sk: _fetch_page(sk, page_size), skips))
+            stop = False
+            for pg in pages:                 # in skip order: keep pages up to the first end/failure
+                if pg is None or len(pg) < page_size:
+                    out.extend(pg or [])
+                    stop = True
+                    break
+                out.extend(pg)
+            if stop:
+                break
+            base += batch * page_size
+    return out[:cap]
+
+
+def load_naar_sellers() -> list:
+    """Distinct Naar sellers (id, store name, business name) across the FULL catalogue."""
     global _sellers_cache
     if _sellers_cache:
         return _sellers_cache
-    products = poc.FIXTURE_NAAR if USE_FIXTURE else poc.fetch_naar_products(limit, 0)
+    products = poc.FIXTURE_NAAR if USE_FIXTURE else _all_naar_products()
     by_id: dict = {}
     for p in products:
         sid = str(p.get("sellerId") or "")
@@ -52,11 +98,27 @@ def load_naar_sellers(limit: int = 200) -> list:
     return _sellers_cache
 
 
-def sellers_with_status() -> list:
-    out = []
-    for s in load_naar_sellers():
-        out.append({**s, "status": {m: poc.store_status(s["seller_id"], m) for m in MARKETPLACES}})
-    return out
+def warm_sellers() -> None:
+    """Load the seller list once, in the background, so the server can serve the
+    page immediately while the (paged) live catalogue is still downloading."""
+    global _sellers_ready, _sellers_error
+    try:
+        load_naar_sellers()
+    except Exception as e:                       # surface, don't hang the UI
+        _sellers_error = f"{type(e).__name__}: {e}"
+    finally:
+        _sellers_ready = True
+
+
+def sellers_with_status():
+    """List for the UI, or a {loading|error} marker so the page can show progress
+    instead of a blank table while the catalogue pages in."""
+    if not _sellers_ready:
+        return {"loading": True}
+    if _sellers_error:
+        return {"error": _sellers_error}
+    return [{**s, "status": {m: poc.store_status(s["seller_id"], m) for m in MARKETPLACES}}
+            for s in _sellers_cache]
 
 
 PAGE = """<!doctype html><meta charset=utf-8><title>Naar store verification</title>
@@ -69,23 +131,48 @@ PAGE = """<!doctype html><meta charset=utf-8><title>Naar store verification</tit
  .cand{display:flex;gap:8px;align-items:center;justify-content:space-between;border-bottom:1px solid #eee;padding:6px 0}
  input[type=text]{padding:5px;border:1px solid #cbb;border-radius:6px;width:340px} .muted{color:#888;font-size:12px} a{color:#0077aa}
 </style>
-<h1>Naar store verification <span class=muted>— confirm each seller's marketplace store before price lookup</span></h1>
+<h1>Naar store verification <span id=cnt class=muted>— confirm each seller's marketplace store before price lookup</span></h1>
 <p class=muted>Confirm the seller's real store on a marketplace (or paste its URL), or mark "not on". Confirmed stores drive <code>--store-first</code>.</p>
+<div id=bar style="display:flex;gap:8px;align-items:center;margin:10px 0;flex-wrap:wrap">
+ <input type=text id=q placeholder="search seller / business / id" style="width:280px">
+ <label class=muted>per page <select id=ps><option>25</option><option>50</option><option>100</option><option value=99999>all</option></select></label>
+ <span style="flex:1"></span>
+ <button id=prev>‹ Prev</button>
+ <span id=pg class=muted>0</span>
+ <button id=next>Next ›</button>
+</div>
 <table id=t><thead><tr><th>Seller (Naar)</th><th>Amazon</th><th>Flipkart</th><th>Meesho</th></tr></thead><tbody></tbody></table>
 <script>
 const MK=["amazon_in","flipkart","meesho"];
+let ALL=[],PAGE=0,PSIZE=25,FILT='';
 async function j(u,o){const r=await fetch(u,o);return r.json()}
 function stChip(s){return `<span class="st ${s}">${s}</span>`}
 async function load(){
- const rows=await j('/api/sellers');const tb=document.querySelector('#t tbody');tb.innerHTML='';
- for(const s of rows){
+ const data=await j('/api/sellers');const tb=document.querySelector('#t tbody');const cnt=document.getElementById('cnt');
+ if(data&&data.loading){cnt.textContent='— loading Naar sellers (paging catalogue)…';tb.innerHTML='<tr><td colspan=4 class=muted>loading…</td></tr>';setTimeout(load,2000);return;}
+ if(data&&data.error){cnt.textContent='';tb.innerHTML=`<tr><td colspan=4 class=muted>could not load sellers: ${esc(data.error)}</td></tr>`;return;}
+ ALL=data;render();
+}
+function render(){
+ const tb=document.querySelector('#t tbody');const cnt=document.getElementById('cnt');
+ const f=FILT.trim().toLowerCase();
+ const rows=f?ALL.filter(s=>((s.store_name||'')+' '+(s.business_name||'')+' '+(s.seller_id||'')).toLowerCase().includes(f)):ALL;
+ const pages=Math.max(1,Math.ceil(rows.length/PSIZE));
+ if(PAGE>=pages)PAGE=pages-1; if(PAGE<0)PAGE=0;
+ const start=PAGE*PSIZE, slice=rows.slice(start,start+PSIZE);
+ cnt.textContent=`— ${rows.length} seller${rows.length===1?'':'s'}`+(f?` (of ${ALL.length})`:'');
+ tb.innerHTML='';
+ for(const s of slice){
   const tr=document.createElement('tr');
-  let cells=`<td><b>${s.store_name||'(no store name)'}</b><div class=muted>${s.business_name||''}<br>${s.seller_id}</div></td>`;
+  let cells=`<td><b>${esc(s.store_name)||'(no store name)'}</b><div class=muted>${esc(s.business_name)}<br>${esc(s.seller_id)}</div></td>`;
   for(const m of MK){cells+=`<td id="c_${s.seller_id}_${m}">${stChip(s.status[m])}<br>
      <button onclick="verify('${s.seller_id}','${m}')">Verify</button>
      <button onclick="reject('${s.seller_id}','${m}')">Not on</button></td>`}
   tr.innerHTML=cells;tb.appendChild(tr);
  }
+ document.getElementById('pg').textContent=rows.length?`${start+1}–${Math.min(start+PSIZE,rows.length)} of ${rows.length}`:'0 of 0';
+ document.getElementById('prev').disabled=PAGE<=0;
+ document.getElementById('next').disabled=PAGE>=pages-1;
 }
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 async function verify(sid,m){
@@ -120,6 +207,10 @@ async function confirmUrl(sid,m){
  const name=document.getElementById(`c_${sid}_${m}`).closest('tr').querySelector('b').textContent.trim();
  await j('/api/confirm',{method:'POST',body:JSON.stringify({seller_id:sid,marketplace:m,store_url:url,seller_display:name})});load();}
 async function reject(sid,m){await j('/api/reject',{method:'POST',body:JSON.stringify({seller_id:sid,marketplace:m})});load();}
+document.getElementById('q').oninput=e=>{FILT=e.target.value;PAGE=0;render();};
+document.getElementById('ps').onchange=e=>{PSIZE=parseInt(e.target.value,10)||25;PAGE=0;render();};
+document.getElementById('prev').onclick=()=>{PAGE--;render();};
+document.getElementById('next').onclick=()=>{PAGE++;render();};
 load();
 </script>"""
 
@@ -187,7 +278,10 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     port = int(os.environ.get("VERIFY_PORT", "8765"))
     src = "fixture" if USE_FIXTURE else "live Naar API"
-    print(f"Store verification: {len(load_naar_sellers())} sellers ({src})")
+    # Load sellers in the background so the page is up instantly; the live
+    # catalogue pages in over a few seconds and the UI fills itself in.
+    threading.Thread(target=warm_sellers, daemon=True).start()
+    print(f"Store verification ({src}) — loading sellers in background")
     print(f"Open http://127.0.0.1:{port}  (writes {poc._registry_path()})")
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
