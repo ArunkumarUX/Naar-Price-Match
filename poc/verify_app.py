@@ -294,6 +294,40 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/run/status":
                 with _job_lock:
                     return self._send(200, json.dumps(dict(_job)))
+            if u.path == "/api/results":
+                q = parse_qs(u.query)
+                def _q(name, default=""):
+                    return (q.get(name) or [default])[0]
+                run_id = _q("run_id")
+                rows, total = results_store.query_results(
+                    run_id=int(run_id) if run_id.isdigit() else None,
+                    status=_q("status") or None, seller=_q("seller") or None,
+                    order=_q("order", "matches_first"),
+                    limit=int(_q("limit", "50") or 50), offset=int(_q("offset", "0") or 0))
+                return self._send(200, json.dumps(
+                    {"rows": rows, "total": total, "run": results_store.latest_run()}))
+            if u.path == "/api/runs":
+                return self._send(200, json.dumps(results_store.list_runs()))
+            if u.path == "/api/results/export.csv":
+                import csv as _csv
+                import io as _io
+                q = parse_qs(u.query)
+                run_id = (q.get("run_id") or [""])[0]
+                rows, _ = results_store.query_results(
+                    run_id=int(run_id) if run_id.isdigit() else None, limit=100000)
+                buf = _io.StringIO()
+                w = _csv.DictWriter(buf, fieldnames=results_store.RESULT_COLS, extrasaction="ignore")
+                w.writeheader()
+                for r in rows:
+                    w.writerow(r)
+                data = buf.getvalue().encode("utf-8-sig")
+                self.send_response(200)
+                self.send_header("content-type", "text/csv; charset=utf-8")
+                self.send_header("content-disposition", 'attachment; filename="naar_price_match.csv"')
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
         except poc.SourceError as e:
             return self._send(500, json.dumps({"error": str(e)}))
         return self._send(404, json.dumps({"error": "not found"}))
