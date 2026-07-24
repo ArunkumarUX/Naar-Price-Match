@@ -180,6 +180,11 @@ PAGE = """<!doctype html><meta charset=utf-8><title>Naar store verification</tit
  input[type=text]{padding:5px;border:1px solid #cbb;border-radius:6px;width:340px} .muted{color:#888;font-size:12px} a{color:#0077aa}
 </style>
 <h1>Naar store verification <span id=cnt class=muted>— confirm each seller's marketplace store before price lookup</span></h1>
+<div id=tabs style="margin:8px 0">
+  <button id=tab_annotate class=primary>Annotate</button>
+  <button id=tab_results>Results</button>
+</div>
+<div id=view_annotate>
 <p class=muted>Confirm the seller's real store on a marketplace (or paste its URL), or mark "not on". Confirmed stores drive <code>--store-first</code>.</p>
 <div id=bar style="display:flex;gap:8px;align-items:center;margin:10px 0;flex-wrap:wrap">
  <input type=text id=q placeholder="search seller / business / id" style="width:280px">
@@ -190,6 +195,25 @@ PAGE = """<!doctype html><meta charset=utf-8><title>Naar store verification</tit
  <button id=next>Next ›</button>
 </div>
 <table id=t><thead><tr><th>Seller (Naar)</th><th>Amazon</th><th>Flipkart</th><th>Meesho</th></tr></thead><tbody></tbody></table>
+</div>
+<div id=view_results style="display:none">
+  <div id=run_panel style="margin:10px 0"></div>
+  <div id=res_bar style="display:flex;gap:8px;align-items:center;margin:10px 0;flex-wrap:wrap">
+    <input type=text id=rq placeholder="filter by seller" style="width:240px">
+    <select id=rstatus>
+      <option value="">all statuses</option>
+      <option>MATCHED</option><option>PRODUCT_NOT_FOUND</option>
+      <option>OUT_OF_STOCK</option><option>SOURCE_ERROR</option>
+    </select>
+    <a id=dlcsv href="/api/results/export.csv"><button>Download CSV</button></a>
+    <span style="flex:1"></span>
+    <button id=rprev>‹ Prev</button><span id=rpg class=muted>0</span><button id=rnext>Next ›</button>
+  </div>
+  <table id=rt><thead><tr>
+    <th>Seller</th><th>Product</th><th>Market</th><th>Naar ₹</th><th>Mkt ₹</th>
+    <th>Δ</th><th>Status</th><th>Sold by</th><th>Also sold by</th>
+  </tr></thead><tbody></tbody></table>
+</div>
 <script>
 const MK=["amazon_in","flipkart","meesho"];
 let ALL=[],PAGE=0,PSIZE=25,FILT='';
@@ -259,6 +283,93 @@ document.getElementById('q').oninput=e=>{FILT=e.target.value;PAGE=0;render();};
 document.getElementById('ps').onchange=e=>{PSIZE=parseInt(e.target.value,10)||25;PAGE=0;render();};
 document.getElementById('prev').onclick=()=>{PAGE--;render();};
 document.getElementById('next').onclick=()=>{PAGE++;render();};
+
+// --- view toggle ---
+function showView(v){
+  document.getElementById('view_annotate').style.display = v==='annotate'?'':'none';
+  document.getElementById('view_results').style.display  = v==='results'?'':'none';
+  document.getElementById('tab_annotate').className = v==='annotate'?'primary':'';
+  document.getElementById('tab_results').className  = v==='results'?'primary':'';
+  if(v==='results') resultsInit();
+}
+document.getElementById('tab_annotate').onclick=()=>showView('annotate');
+document.getElementById('tab_results').onclick=()=>showView('results');
+
+// --- results state ---
+let RPAGE=0, RPSIZE=25, RQ='', RSTATUS='';
+let _pollTimer=null;
+
+async function resultsInit(){
+  const st=await j('/api/run/status');
+  if(st.status==='running'){ renderRunning(st); pollRun(); }
+  else { renderRunPanel(st); loadResults(); }
+}
+function renderRunPanel(st){
+  const p=document.getElementById('run_panel');
+  const note = st.status==='error' ? `<span class=muted>last run error: ${esc(st.error)}</span>` : '';
+  p.innerHTML=`<button id=runbtn class=primary>Finalize &amp; run price match</button> ${note}`;
+  document.getElementById('runbtn').onclick=previewRun;
+}
+async function previewRun(){
+  const pv=await j('/api/run/preview');
+  const p=document.getElementById('run_panel');
+  p.innerHTML=`<div class=cands>Will check <b>${pv.products}</b> products across
+    <b>${pv.sellers}</b> confirmed sellers (~<b>${pv.api_calls_est}</b> ScraperAPI calls, paid).
+    <button id=go class=primary>Run</button> <button id=cancel>Cancel</button></div>`;
+  document.getElementById('cancel').onclick=()=>renderRunPanel({status:'idle'});
+  document.getElementById('go').onclick=async()=>{
+    const r=await j('/api/run',{method:'POST',body:'{}'});
+    if(r&&r.error){ p.innerHTML=`<span class=muted>${esc(r.error)}</span>`; renderRunPanel({status:'idle'}); return; }
+    pollRun();
+  };
+}
+function renderRunning(st){
+  document.getElementById('run_panel').innerHTML=
+    `<div class=cands>running price match… <b>${st.done}</b> / <b>${st.total||'?'}</b></div>`;
+}
+function pollRun(){
+  clearTimeout(_pollTimer);
+  _pollTimer=setTimeout(async()=>{
+    const st=await j('/api/run/status');
+    if(st.status==='running'){ renderRunning(st); pollRun(); }
+    else { renderRunPanel(st); loadResults(); }
+  },1500);
+}
+async function loadResults(){
+  const url=`/api/results?status=${encodeURIComponent(RSTATUS)}&seller=${encodeURIComponent(RQ)}`
+    +`&limit=${RPSIZE}&offset=${RPAGE*RPSIZE}`;
+  const d=await j(url);
+  const tb=document.querySelector('#rt tbody'); tb.innerHTML='';
+  document.getElementById('dlcsv').href='/api/results/export.csv';
+  const rows=d.rows||[];
+  if(!rows.length){ tb.innerHTML='<tr><td colspan=9 class=muted>no results yet — run a price match</td></tr>'; }
+  for(const r of rows){
+    const naar=r.naar_selling_price, mkt=(r.marketplace_unit_price!=null?r.marketplace_unit_price:r.marketplace_selling_price);
+    const delta=(naar!=null&&mkt!=null)?(mkt-naar):null;
+    const dtxt=delta==null?'':(delta>=0?`+${delta.toFixed(2)}`:delta.toFixed(2));
+    const dcol=delta==null?'':(delta<0?'#0a0':'#a00');
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${esc(r.naar_seller_name||r.naar_seller_id)}</td>
+      <td>${esc(r.naar_product_title)} <span class=muted>${esc(r.naar_variant_name||'')}</span></td>
+      <td>${esc(r.marketplace)}</td>
+      <td>${naar!=null?naar.toFixed(2):''}</td>
+      <td>${mkt!=null?mkt.toFixed(2):''}</td>
+      <td style="color:${dcol}">${dtxt}</td>
+      <td>${stChip((r.status||'').toLowerCase().slice(0,4))}${esc(r.status)}</td>
+      <td>${esc(r.marketplace_sold_by||'')}</td>
+      <td class=muted>${esc((r.other_sellers||'').slice(0,60))}</td>`;
+    tb.appendChild(tr);
+  }
+  const total=d.total||0, start=RPAGE*RPSIZE;
+  document.getElementById('rpg').textContent= total?`${start+1}–${Math.min(start+RPSIZE,total)} of ${total}`:'0';
+  document.getElementById('rprev').disabled= RPAGE<=0;
+  document.getElementById('rnext').disabled= start+RPSIZE>=total;
+}
+document.getElementById('rq').oninput=e=>{RQ=e.target.value;RPAGE=0;loadResults();};
+document.getElementById('rstatus').onchange=e=>{RSTATUS=e.target.value;RPAGE=0;loadResults();};
+document.getElementById('rprev').onclick=()=>{if(RPAGE>0){RPAGE--;loadResults();}};
+document.getElementById('rnext').onclick=()=>{RPAGE++;loadResults();};
+
 load();
 </script>"""
 
