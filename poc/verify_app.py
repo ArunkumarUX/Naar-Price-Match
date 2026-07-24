@@ -146,6 +146,27 @@ def _run_scan_job(plan) -> None:
             _job.update(status="error", error=f"{type(e).__name__}: {e}")
 
 
+# High-similarity auto-confirm sweep (separate job from the price-match run).
+_sweep_job = {"status": "idle", "done": 0, "total": 0, "confirmed": 0, "started": "", "error": ""}
+_sweep_lock = threading.Lock()
+
+
+def _run_sweep_job(plan) -> None:
+    """Background worker: discover + auto-confirm high-similarity pending stores."""
+    try:
+        def progress(done, total):
+            with _sweep_lock:
+                _sweep_job["done"], _sweep_job["total"] = done, total
+        results = poc.auto_confirm_sweep(plan, _adapters(), progress_cb=progress)
+        n_confirmed = sum(1 for r in results if r.get("action") == "confirmed")
+        with _sweep_lock:
+            _sweep_job.update(status="done", confirmed=n_confirmed,
+                              done=len(plan), total=len(plan))
+    except Exception as e:
+        with _sweep_lock:
+            _sweep_job.update(status="error", error=f"{type(e).__name__}: {e}")
+
+
 def warm_sellers() -> None:
     """Load the seller list once, in the background, so the server can serve the
     page immediately while the (paged) live catalogue is still downloading."""
@@ -186,6 +207,7 @@ PAGE = """<!doctype html><meta charset=utf-8><title>Naar store verification</tit
 </div>
 <div id=view_annotate>
 <p class=muted>Confirm the seller's real store on a marketplace (or paste its URL), or mark "not on". Confirmed stores drive <code>--store-first</code>.</p>
+<div id=sweep_panel style="margin:8px 0"></div>
 <div id=bar style="display:flex;gap:8px;align-items:center;margin:10px 0;flex-wrap:wrap">
  <input type=text id=q placeholder="search seller / business / id" style="width:280px">
  <label class=muted>per page <select id=ps><option>25</option><option>50</option><option>100</option><option value=99999>all</option></select></label>
@@ -279,6 +301,48 @@ async function confirmUrl(sid,m){
  const name=document.getElementById(`c_${sid}_${m}`).closest('tr').querySelector('b').textContent.trim();
  await j('/api/confirm',{method:'POST',body:JSON.stringify({seller_id:sid,marketplace:m,store_url:url,seller_display:name})});load();}
 async function reject(sid,m){await j('/api/reject',{method:'POST',body:JSON.stringify({seller_id:sid,marketplace:m})});load();}
+
+// --- high-similarity auto-confirm sweep ---
+let _sweepTimer=null;
+async function sweepInit(){
+ const st=await j('/api/autoconfirm/status');
+ if(st.status==='running'){sweepRunning(st);sweepPoll();} else sweepPanel(st);
+}
+function sweepPanel(st){
+ const p=document.getElementById('sweep_panel');
+ const note = st&&st.status==='done' ? `<span class=muted>last sweep auto-confirmed ${st.confirmed} store(s)</span>`
+   : (st&&st.status==='error' ? `<span class=muted>last sweep error: ${esc(st.error)}</span>` : '');
+ p.innerHTML=`<button id=sweepbtn>⚡ Auto-confirm high-confidence (sim &gt; 0.9)</button> ${note}`;
+ document.getElementById('sweepbtn').onclick=sweepPreview;
+}
+async function sweepPreview(){
+ const pv=await j('/api/autoconfirm/preview');
+ const p=document.getElementById('sweep_panel');
+ p.innerHTML=`<div class=cands>Auto-confirm sweep will run store discovery on <b>${pv.pairs}</b> pending
+   seller×marketplace pair(s) across <b>${pv.sellers}</b> sellers (~<b>${pv.api_calls_est}</b> ScraperAPI calls, paid),
+   and confirm only exact/near-exact name matches (sim &gt; 0.9), tagged <i>auto</i>.
+   <button id=sweepgo class=primary>Run sweep</button> <button id=sweepcancel>Cancel</button></div>`;
+ document.getElementById('sweepcancel').onclick=()=>sweepPanel({status:'idle'});
+ document.getElementById('sweepgo').onclick=async()=>{
+   const r=await j('/api/autoconfirm',{method:'POST',body:'{}'});
+   if(r&&r.error){p.innerHTML=`<span class=muted>${esc(r.error)}</span>`;setTimeout(()=>sweepPanel({status:'idle'}),1500);return;}
+   sweepPoll();
+ };
+}
+function sweepRunning(st){
+ document.getElementById('sweep_panel').innerHTML=
+   `<div class=cands>auto-confirm sweep running… <b>${st.done}</b> / <b>${st.total||'?'}</b> pair(s)</div>`;
+}
+function sweepPoll(){
+ clearTimeout(_sweepTimer);
+ _sweepTimer=setTimeout(async()=>{
+   const st=await j('/api/autoconfirm/status');
+   if(st.status==='running'){sweepRunning(st);sweepPoll();}
+   else{sweepPanel(st);_sellers_cache_bust();}
+ },1500);
+}
+function _sellers_cache_bust(){ /* reload seller statuses after a sweep changed them */ load(); }
+
 document.getElementById('q').oninput=e=>{FILT=e.target.value;PAGE=0;render();};
 document.getElementById('ps').onchange=e=>{PSIZE=parseInt(e.target.value,10)||25;PAGE=0;render();};
 document.getElementById('prev').onclick=()=>{PAGE--;render();};
@@ -371,6 +435,7 @@ document.getElementById('rprev').onclick=()=>{if(RPAGE>0){RPAGE--;loadResults();
 document.getElementById('rnext').onclick=()=>{RPAGE++;loadResults();};
 
 load();
+sweepInit();
 </script>"""
 
 
@@ -413,6 +478,13 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/run/status":
                 with _job_lock:
                     return self._send(200, json.dumps(dict(_job)))
+            if u.path == "/api/autoconfirm/preview":
+                plan = poc.auto_confirm_plan(load_naar_sellers(), _adapters())
+                return self._send(200, json.dumps({k: plan[k] for k in
+                    ("sellers", "pairs", "api_calls_est")}))
+            if u.path == "/api/autoconfirm/status":
+                with _sweep_lock:
+                    return self._send(200, json.dumps(dict(_sweep_job)))
             if u.path == "/api/results":
                 q = parse_qs(u.query)
                 def _q(name, default=""):
@@ -475,6 +547,21 @@ class Handler(BaseHTTPRequestHandler):
                         _job.update(status="error", error="no confirmed stores to run")
                     return self._send(400, json.dumps({"error": "no confirmed stores to run"}))
                 threading.Thread(target=_run_scan_job, args=(plan["plan"],), daemon=True).start()
+                return self._send(200, json.dumps({"started": True, "total": len(plan["plan"])}))
+            if u.path == "/api/autoconfirm":
+                with _sweep_lock:
+                    if _sweep_job["status"] == "running":
+                        return self._send(409, json.dumps({"error": "a sweep is already in progress"}))
+                    _sweep_job.update(status="running", done=0, total=0, confirmed=0,
+                                      started=poc._now_iso(), error="")
+                plan = poc.auto_confirm_plan(load_naar_sellers(), _adapters())
+                with _sweep_lock:
+                    _sweep_job["total"] = len(plan["plan"])
+                if not plan["plan"]:
+                    with _sweep_lock:
+                        _sweep_job.update(status="error", error="no pending stores to sweep")
+                    return self._send(400, json.dumps({"error": "no pending stores to sweep"}))
+                threading.Thread(target=_run_sweep_job, args=(plan["plan"],), daemon=True).start()
                 return self._send(200, json.dumps({"started": True, "total": len(plan["plan"])}))
             if u.path == "/api/confirm":
                 poc.confirm_store(body["seller_id"], body["marketplace"],

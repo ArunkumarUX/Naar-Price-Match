@@ -301,11 +301,14 @@ def _now_iso() -> str:
 
 
 def confirm_store(seller_id: str, marketplace: str, store_url: str = "",
-                  seller_display: str = "") -> dict:
-    """Human confirmed the seller's store on `marketplace`. Records the store URL
-    when known and/or the confirmed 'Sold by' name (the structured API exposes the
-    name, not a URL) + audit status; clears any prior rejection. At least one of
-    store_url / seller_display is required."""
+                  seller_display: str = "", source: str = "human",
+                  similarity: Optional[float] = None) -> dict:
+    """Confirm the seller's store on `marketplace`. Records the store URL when known
+    and/or the confirmed 'Sold by' name (the structured API exposes the name, not a
+    URL) + audit status; clears any prior rejection. At least one of store_url /
+    seller_display is required. `source` is "human" (a person clicked Confirm) or
+    "auto" (a high-similarity sweep confirmed it) — auto rows stay reviewable and
+    carry the `similarity` that cleared the threshold."""
     store_url = (store_url or "").strip()
     seller_display = (seller_display or "").strip()
     if not store_url and not seller_display:
@@ -322,6 +325,8 @@ def confirm_store(seller_id: str, marketplace: str, store_url: str = "",
             "store_url": store_url,
             "seller_display": seller_display,
             "status": "confirmed",
+            "source": source,
+            "similarity": similarity,
             "verified_at": _now_iso(),
         }
         _save_registry_file(data)
@@ -1237,6 +1242,60 @@ def scan_confirmed(plan: list, adapters: dict, progress_cb=None,
     return records
 
 
+def auto_confirm_plan(sellers: list, adapters: dict) -> dict:
+    """Cost preview for the high-similarity auto-confirm sweep — NO network. A pair
+    is one (pending seller, marketplace) where the marketplace supports store
+    discovery (`discover_stores`). Only PENDING seller×marketplace cells are swept;
+    already confirmed/rejected ones are left alone."""
+    supported = [m for m, a in adapters.items() if hasattr(a, "discover_stores")]
+    plan = []
+    seen = set()
+    for s in sellers:
+        sid = str(s.get("seller_id") or "")
+        name = s.get("store_name") or s.get("business_name") or ""
+        if not sid or not name:
+            continue
+        for m in supported:
+            if store_status(sid, m) == "pending":
+                plan.append((s, m))
+                seen.add(sid)
+    # ~1 search + up to 8 product fetches per discovery
+    return {"sellers": len(seen), "pairs": len(plan),
+            "api_calls_est": len(plan) * 9, "plan": plan}
+
+
+def auto_confirm_sweep(plan: list, adapters: dict, threshold: float = 0.9,
+                       progress_cb=None) -> list:
+    """Run store discovery for each pending pair and AUTO-CONFIRM the top candidate
+    when its similarity exceeds `threshold` (exact/near-exact name twins only). The
+    confirm is tagged source="auto" + the similarity, so it stays reviewable. Never
+    aborts on one failure. Returns a per-pair action log. Calls progress_cb after
+    each pair."""
+    total = len(plan)
+    results = []
+    for i, (seller, marketplace) in enumerate(plan):
+        sid = str(seller.get("seller_id") or "")
+        name = seller.get("store_name") or seller.get("business_name") or ""
+        try:
+            cands = propose_stores(name, marketplace, adapters[marketplace])
+        except SourceError as e:
+            cands = [{"error": str(e)}]
+        top = cands[0] if cands and isinstance(cands[0], dict) and "error" not in cands[0] else None
+        sim = (top or {}).get("similarity")
+        if top and sim is not None and sim > threshold:
+            confirm_store(sid, marketplace, top.get("store_url", ""),
+                          top.get("seller_display", ""), source="auto", similarity=sim)
+            results.append({"seller_id": sid, "seller_name": name, "marketplace": marketplace,
+                            "action": "confirmed", "seller_display": top.get("seller_display", ""),
+                            "similarity": sim})
+        else:
+            results.append({"seller_id": sid, "seller_name": name, "marketplace": marketplace,
+                            "action": "skipped", "best_similarity": sim})
+        if progress_cb:
+            progress_cb(i + 1, total)
+    return results
+
+
 def run(args) -> list[Record]:
     if args.backend == "fixture":
         products = FIXTURE_NAAR
@@ -1725,6 +1784,66 @@ def _test_scan(check):
           list(_rs.RESULT_COLS) == [f.name for f in dataclasses.fields(Record)])
 
 
+def _test_auto_confirm(check):
+    """auto_confirm_plan is free + counts only PENDING pairs on discovery-capable
+    marketplaces; auto_confirm_sweep confirms only candidates above the threshold,
+    tagging them source='auto'."""
+    import tempfile as _tf
+    global _seller_identity_cache
+    saved = os.environ.get("NAAR_KYC_FILE")
+    fd, reg = _tf.mkstemp(suffix=".json")
+    os.close(fd)
+    os.environ["NAAR_KYC_FILE"] = reg
+    _seller_identity_cache = None
+
+    class _DiscStub(MarketplaceAdapter):        # has discover_stores -> supported
+        name = "amazon_in"
+        def __init__(self, cands):
+            self._c = cands
+        def discover_stores(self, brand, **kw):
+            return list(self._c)
+    try:
+        sellers = [{"seller_id": "sa", "store_name": "Alpha", "business_name": ""},
+                   {"seller_id": "sb", "store_name": "Beta", "business_name": ""}]
+        # amazon_in supports discovery; flipkart (no discover_stores) does not
+        adapters = {"amazon_in": _DiscStub([{"seller_display": "Alpha", "similarity": 0.95,
+                                             "store_url": "", "store_id": ""}]),
+                    "flipkart": FlipkartAdapter()}
+        plan = auto_confirm_plan(sellers, adapters)
+        check("auto plan counts pending pairs on discovery marketplaces only",
+              plan["pairs"] == 2 and all(m == "amazon_in" for _, m in plan["plan"]))
+        check("auto plan estimates api calls", plan["api_calls_est"] == plan["pairs"] * 9)
+
+        # sa: top sim 0.95 > 0.9 -> auto-confirm; sb: top sim 0.50 -> skip
+        class _Router(MarketplaceAdapter):
+            name = "amazon_in"
+            def discover_stores(self, brand, **kw):
+                if brand == "Alpha":
+                    return [{"seller_display": "Alpha", "similarity": 0.95, "store_url": "", "store_id": ""}]
+                return [{"seller_display": "Bee", "similarity": 0.50, "store_url": "", "store_id": ""}]
+        seen = []
+        res = auto_confirm_sweep(plan["plan"], {"amazon_in": _Router()},
+                                 progress_cb=lambda d, t: seen.append((d, t)))
+        confirmed = [r for r in res if r["action"] == "confirmed"]
+        check("sweep auto-confirms only above-threshold (sa), skips sb",
+              len(confirmed) == 1 and confirmed[0]["seller_id"] == "sa")
+        check("sweep progress_cb called once per pair", seen == [(1, 2), (2, 2)])
+        check("auto-confirmed store is status=confirmed, source=auto, keeps similarity",
+              store_status("sa", "amazon_in") == "confirmed"
+              and _confirmed_store("sa", "amazon_in").get("source") == "auto"
+              and _confirmed_store("sa", "amazon_in").get("similarity") == 0.95)
+        check("below-threshold seller stays pending", store_status("sb", "amazon_in") == "pending")
+    finally:
+        _seller_identity_cache = None
+        os.environ.pop("NAAR_KYC_FILE", None)
+        if saved is not None:
+            os.environ["NAAR_KYC_FILE"] = saved
+        try:
+            os.remove(reg)
+        except OSError:
+            pass
+
+
 def self_test() -> int:
     """Offline regression checks for the store-first + structured-API spine."""
     failures: list[str] = []
@@ -1746,6 +1865,7 @@ def self_test() -> int:
     _test_record_honesty(check)
     _test_store_registry(check)
     _test_scan(check)
+    _test_auto_confirm(check)
 
     print(f"\n{len(failures)} failure(s)" if failures else "\nAll checks passed.")
     return 1 if failures else 0
