@@ -94,6 +94,41 @@ def list_runs(path=None) -> list:
         return [dict(r) for r in conn.execute("SELECT * FROM run ORDER BY id DESC")]
 
 
+def query_results(run_id=None, status=None, seller=None, order="matches_first",
+                  limit=50, offset=0, path=None):
+    init_db(path)
+    if run_id is None:
+        lr = latest_run(path)
+        if not lr:
+            return [], 0
+        run_id = lr["id"]
+    where = ["run_id = ?"]
+    args = [run_id]
+    if status:
+        where.append("status = ?")
+        args.append(status)
+    if seller:
+        where.append("(lower(naar_seller_name) LIKE ? OR lower(naar_seller_id) LIKE ?)")
+        like = f"%{seller.lower()}%"
+        args += [like, like]
+    clause = " AND ".join(where)
+    # Δ per unit vs Naar: prefer unit price, else selling price.
+    delta = ("(COALESCE(marketplace_unit_price, marketplace_selling_price) - naar_selling_price)")
+    if order == "delta":
+        order_by = f"{delta} DESC"
+    elif order == "seller":
+        order_by = "lower(naar_seller_name), naar_product_title"
+    else:  # matches_first: MATCHED rows first, then largest absolute Δ
+        order_by = (f"(status = 'MATCHED') DESC, "
+                    f"ABS({delta}) DESC, id ASC")
+    with _connect(path) as conn:
+        total = conn.execute(f"SELECT COUNT(*) AS n FROM result WHERE {clause}", args).fetchone()["n"]
+        rows = conn.execute(
+            f"SELECT * FROM result WHERE {clause} ORDER BY {order_by} LIMIT ? OFFSET ?",
+            args + [int(limit), int(offset)]).fetchall()
+    return [dict(r) for r in rows], total
+
+
 def _self_test() -> int:
     import tempfile
     fails = []
@@ -107,20 +142,38 @@ def _self_test() -> int:
     try:
         init_db(path)
         rid = save_run(
-            {"started_at": "t0", "finished_at": "t1", "status": "done",
-             "total": 2, "done": 2, "seller_count": 1, "product_count": 1,
-             "api_calls_est": 3, "error": ""},
-            [{"naar_seller_id": "s1", "naar_product_title": "Amla", "marketplace": "amazon_in",
-              "status": "MATCHED", "marketplace_selling_price": 99.0},
-             {"naar_seller_id": "s1", "naar_product_title": "Amla", "marketplace": "flipkart",
-              "status": "SOURCE_ERROR"}],
+            {"started_at": "t0", "finished_at": "t1", "status": "done", "total": 4, "done": 4,
+             "seller_count": 2, "product_count": 3, "api_calls_est": 6, "error": ""},
+            [{"naar_seller_id": "s1", "naar_seller_name": "Alpha", "naar_product_title": "A",
+              "marketplace": "amazon_in", "status": "MATCHED",
+              "naar_selling_price": 100.0, "marketplace_unit_price": 130.0},   # Δ +30
+             {"naar_seller_id": "s1", "naar_seller_name": "Alpha", "naar_product_title": "B",
+              "marketplace": "amazon_in", "status": "MATCHED",
+              "naar_selling_price": 100.0, "marketplace_unit_price": 60.0},    # Δ -40 (bigger |Δ|)
+             {"naar_seller_id": "s2", "naar_seller_name": "Beta", "naar_product_title": "C",
+              "marketplace": "amazon_in", "status": "PRODUCT_NOT_FOUND"},
+             {"naar_seller_id": "s2", "naar_seller_name": "Beta", "naar_product_title": "D",
+              "marketplace": "flipkart", "status": "SOURCE_ERROR"}],
             path)
         check("save_run returns an int run id", isinstance(rid, int) and rid > 0)
         lr = latest_run(path)
         check("latest_run returns the saved run", lr and lr["id"] == rid and lr["status"] == "done")
-        check("latest_run carries counts", lr["total"] == 2 and lr["seller_count"] == 1)
+        check("latest_run carries counts", lr["total"] == 4 and lr["seller_count"] == 2)
         runs = list_runs(path)
         check("list_runs returns one run", len(runs) == 1 and runs[0]["id"] == rid)
+        rows, total = query_results(status="MATCHED", path=path)
+        check("query filters by status", total == 2 and all(r["status"] == "MATCHED" for r in rows))
+        rows, _ = query_results(order="matches_first", path=path)
+        check("matches_first puts MATCHED before others", rows[0]["status"] == "MATCHED")
+        check("matches_first orders MATCHED by |delta| desc (B before A)",
+              [r["naar_product_title"] for r in rows if r["status"] == "MATCHED"] == ["B", "A"])
+        rows, total = query_results(seller="beta", path=path)
+        check("query filters by seller substring (case-insensitive)",
+              total == 2 and all(r["naar_seller_id"] == "s2" for r in rows))
+        rows, total = query_results(limit=1, offset=0, path=path)
+        check("pagination returns limit rows but full total", len(rows) == 1 and total == 4)
+        rows2, _ = query_results(limit=1, offset=1, path=path)
+        check("pagination offset advances", rows2 and rows2[0] != rows[0])
         rid2 = save_run({"started_at": "t2", "finished_at": "t3", "status": "done",
                          "total": 0, "done": 0, "seller_count": 0, "product_count": 0,
                          "api_calls_est": 0, "error": ""}, [], path)
