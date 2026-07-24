@@ -35,6 +35,7 @@ Outputs: results.csv / results.jsonl in --out.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import dataclasses
 import datetime as dt
@@ -626,12 +627,16 @@ class AmazonInAdapter(MarketplaceAdapter):
     def search(self, query: str) -> list[Candidate]:
         cands = _amazon_structured_candidates(
             _scraperapi_structured("amazon/search", {"query": query}), self.name)
-        for c in cands:
+
+        def _fill(c):   # per-candidate product lookup (independent -> run concurrently)
             try:
                 d = _scraperapi_structured("amazon/product", {"asin": c.listing_id})
                 c.offers = [_amazon_structured_offer(d, c.listing_id)]
             except SourceError as e:
                 c.offers, c.offers_error = [], str(e)
+        if cands:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(cands))) as ex:
+                list(ex.map(_fill, cands))
         return cands
 
     def discover_stores(self, brand: str, scan: int = 40, max_fetch: int = 8) -> list[dict]:
@@ -659,26 +664,35 @@ class AmazonInAdapter(MarketplaceAdapter):
             if asin and asin not in seen_asin and all(t in title.casefold() for t in toks):
                 seen_asin.add(asin)
                 hits.append((asin, title))
-        stores: dict[str, dict] = {}
-        for asin, title in hits[:max_fetch]:
+        # Each product's 'sold by' is a separate (slow) structured call; they're
+        # independent, so fetch them CONCURRENTLY — sequential is ~N×latency.
+        def _sold_by(asin_title):
+            asin, title = asin_title
             try:
                 off = _amazon_structured_offer(
                     _scraperapi_structured("amazon/product", {"asin": asin}), asin)
             except SourceError:
-                continue
-            if not off.seller_display:
-                continue
-            key = _seller_id_from_url(off.seller_url) or norm_name(off.seller_display)
-            store = stores.setdefault(key, {
-                "store_id": _seller_id_from_url(off.seller_url),
-                "store_url": off.seller_url or "",
-                "seller_display": off.seller_display,
-                "sample_title": title,
-                "sample_listing": f"https://www.amazon.in/dp/{asin}",
-                "similarity": round(name_compare(off.seller_display, brand)[0], 3),
-                "n_products": 0,
-            })
-            store["n_products"] += 1
+                return None
+            return (asin, title, off) if off.seller_display else None
+
+        picks = hits[:max_fetch]
+        stores: dict[str, dict] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(picks) or 1)) as ex:
+            for res in ex.map(_sold_by, picks):
+                if res is None:
+                    continue
+                asin, title, off = res
+                key = _seller_id_from_url(off.seller_url) or norm_name(off.seller_display)
+                store = stores.setdefault(key, {
+                    "store_id": _seller_id_from_url(off.seller_url),
+                    "store_url": off.seller_url or "",
+                    "seller_display": off.seller_display,
+                    "sample_title": title,
+                    "sample_listing": f"https://www.amazon.in/dp/{asin}",
+                    "similarity": round(name_compare(off.seller_display, brand)[0], 3),
+                    "n_products": 0,
+                })
+                store["n_products"] += 1
         return sorted(stores.values(), key=lambda s: (-s["n_products"], -s["similarity"]))
 
 
