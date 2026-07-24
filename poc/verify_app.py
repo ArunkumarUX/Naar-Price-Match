@@ -38,6 +38,14 @@ _job = {"status": "idle", "done": 0, "total": 0, "run_id": None, "started": "", 
 _job_lock = threading.Lock()
 
 
+def _int(v, default):
+    """Safe int conversion with fallback for non-numeric values."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _adapter(marketplace: str):
     return {"amazon_in": poc.AmazonInAdapter, "flipkart": poc.FlipkartAdapter,
             "meesho": poc.MeeshoAdapter}[marketplace]()
@@ -303,7 +311,7 @@ class Handler(BaseHTTPRequestHandler):
                     run_id=int(run_id) if run_id.isdigit() else None,
                     status=_q("status") or None, seller=_q("seller") or None,
                     order=_q("order", "matches_first"),
-                    limit=int(_q("limit", "50") or 50), offset=int(_q("offset", "0") or 0))
+                    limit=_int(_q("limit", "50"), 50), offset=_int(_q("offset", "0"), 0))
                 return self._send(200, json.dumps(
                     {"rows": rows, "total": total, "run": results_store.latest_run()}))
             if u.path == "/api/runs":
