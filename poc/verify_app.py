@@ -32,6 +32,11 @@ _sellers_ready = False          # set once the (paged) seller list has loaded
 _sellers_error = ""             # non-empty if the live catalogue fetch failed
 _lock = threading.Lock()
 
+import results_store
+_products_cache: list = []
+_job = {"status": "idle", "done": 0, "total": 0, "run_id": None, "started": "", "error": ""}
+_job_lock = threading.Lock()
+
 
 def _adapter(marketplace: str):
     return {"amazon_in": poc.AmazonInAdapter, "flipkart": poc.FlipkartAdapter,
@@ -96,6 +101,41 @@ def load_naar_sellers() -> list:
                       "business_name": s.get("businessName") or ""}
     _sellers_cache = sorted(by_id.values(), key=lambda x: x["store_name"].lower())
     return _sellers_cache
+
+
+def _catalogue() -> list:
+    """Full product list for a run (cached). Fixture list offline; live catalogue otherwise."""
+    global _products_cache
+    if _products_cache:
+        return _products_cache
+    _products_cache = list(poc.FIXTURE_NAAR) if USE_FIXTURE else _all_naar_products()
+    return _products_cache
+
+
+def _adapters() -> dict:
+    return {m: _adapter(m) for m in MARKETPLACES}
+
+
+def _run_scan_job(plan) -> None:
+    """Background worker: run the plan, persist to SQLite, update _job."""
+    try:
+        def progress(done, total):
+            with _job_lock:
+                _job["done"], _job["total"] = done, total
+        records = poc.scan_confirmed(plan, _adapters(), progress_cb=progress)
+        rows = [__import__("dataclasses").asdict(r) for r in records]
+        n_sellers = len({r.get("naar_seller_id") for r in rows})
+        n_products = len({r.get("naar_product_id") for r in rows})
+        rid = results_store.save_run(
+            {"started_at": _job["started"], "finished_at": poc._now_iso(), "status": "done",
+             "total": len(plan), "done": len(plan), "seller_count": n_sellers,
+             "product_count": n_products, "api_calls_est": len(plan) * 6, "error": ""},
+            rows)
+        with _job_lock:
+            _job.update(status="done", run_id=rid, done=len(plan), total=len(plan))
+    except Exception as e:                    # never leave the job stuck on "running"
+        with _job_lock:
+            _job.update(status="error", error=f"{type(e).__name__}: {e}")
 
 
 def warm_sellers() -> None:
@@ -247,6 +287,13 @@ class Handler(BaseHTTPRequestHandler):
                 if cands and cands[0].get("error"):
                     return self._send(200, json.dumps({"error": cands[0]["error"]}))
                 return self._send(200, json.dumps(cands))
+            if u.path == "/api/run/preview":
+                plan = poc.confirmed_scan_plan(_catalogue(), list(MARKETPLACES))
+                return self._send(200, json.dumps({k: plan[k] for k in
+                    ("sellers", "products", "pairs", "api_calls_est")}))
+            if u.path == "/api/run/status":
+                with _job_lock:
+                    return self._send(200, json.dumps(dict(_job)))
         except poc.SourceError as e:
             return self._send(500, json.dumps({"error": str(e)}))
         return self._send(404, json.dumps({"error": "not found"}))
@@ -261,6 +308,21 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):                            # JSON null/array/scalar -> 400
             return self._send(400, json.dumps({"error": "body must be a JSON object"}))
         try:
+            if u.path == "/api/run":
+                with _job_lock:
+                    if _job["status"] == "running":
+                        return self._send(409, json.dumps({"error": "a run is already in progress"}))
+                    _job.update(status="running", done=0, total=0, run_id=None,
+                                started=poc._now_iso(), error="")
+                plan = poc.confirmed_scan_plan(_catalogue(), list(MARKETPLACES))
+                with _job_lock:
+                    _job["total"] = len(plan["plan"])
+                if not plan["plan"]:
+                    with _job_lock:
+                        _job.update(status="error", error="no confirmed stores to run")
+                    return self._send(400, json.dumps({"error": "no confirmed stores to run"}))
+                threading.Thread(target=_run_scan_job, args=(plan["plan"],), daemon=True).start()
+                return self._send(200, json.dumps({"started": True, "total": len(plan["plan"])}))
             if u.path == "/api/confirm":
                 poc.confirm_store(body["seller_id"], body["marketplace"],
                                   body.get("store_url", ""), body.get("seller_display", ""))
