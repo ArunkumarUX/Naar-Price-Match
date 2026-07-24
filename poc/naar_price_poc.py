@@ -1187,6 +1187,33 @@ def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
                                  + ("; see other_sellers" if other_offers else ""))
 
 
+def confirmed_scan_plan(products: list, marketplaces: list) -> dict:
+    """Cost preview for a store-first run — NO network. Expands every
+    (product, variant, marketplace) whose seller's store is CONFIRMED on that
+    marketplace. `plan` items are (product, variant, marketplace, store)."""
+    plan = []
+    sellers = set()
+    prod_ids = set()
+    for product in products:
+        sid = str(product.get("sellerId") or "")
+        confirmed = [m for m in marketplaces if store_status(sid, m) == "confirmed"]
+        if not confirmed:
+            continue
+        for variant in iter_variants(product):
+            if _to_float(variant.get("sellingPrice")) is None:
+                continue
+            for m in confirmed:
+                store = _confirmed_store(sid, m)
+                if store is None:
+                    continue
+                plan.append((product, variant, m, store))
+                sellers.add(sid)
+                prod_ids.add(product.get("_id", ""))
+    # each pair ~ 1 search + up to 5 product fetches (AmazonInAdapter caps at 5)
+    return {"sellers": len(sellers), "products": len(prod_ids), "pairs": len(plan),
+            "api_calls_est": len(plan) * 6, "plan": plan}
+
+
 def run(args) -> list[Record]:
     if args.backend == "fixture":
         products = FIXTURE_NAAR
@@ -1609,6 +1636,47 @@ def _rm(path: str) -> None:
         pass
 
 
+def _test_scan(check):
+    """confirmed_scan_plan is free (no network) and expands only CONFIRMED
+    (product, variant, marketplace) pairs; scan_confirmed runs them store-first."""
+    import tempfile as _tf
+    global _seller_identity_cache
+    saved = os.environ.get("NAAR_KYC_FILE")
+    fd, reg = _tf.mkstemp(suffix=".json")
+    os.close(fd)
+    os.environ["NAAR_KYC_FILE"] = reg
+    _seller_identity_cache = None
+    try:
+        confirm_store("sa", "amazon_in", seller_display="Alpha Store")
+        # products: sa confirmed on amazon_in (1 variant) -> 1 pair; sb unconfirmed -> 0
+        products = [
+            {"_id": "pa", "title": "Amla", "sellerId": "sa", "seller": {"storeName": "Alpha Store"},
+             "variants": [{"_id": "va", "attributes": {"weight": "100g"}, "variantName": "100g",
+                           "sellingPrice": 90.0}]},
+            {"_id": "pb", "title": "Honey", "sellerId": "sb", "seller": {"storeName": "Beta"},
+             "variants": [{"_id": "vb", "attributes": {}, "variantName": "-", "sellingPrice": 50.0}]},
+        ]
+        plan = confirmed_scan_plan(products, ["amazon_in", "flipkart"])
+        check("plan counts only confirmed pairs", plan["pairs"] == 1 and plan["sellers"] == 1)
+        check("plan skips unconfirmed sellers",
+              all(item[0]["sellerId"] == "sa" for item in plan["plan"]))
+        check("plan estimates api calls (>= pairs)", plan["api_calls_est"] >= plan["pairs"])
+    finally:
+        _seller_identity_cache = None
+        os.environ.pop("NAAR_KYC_FILE", None)
+        if saved is not None:
+            os.environ["NAAR_KYC_FILE"] = saved
+        try:
+            os.remove(reg)
+        except OSError:
+            pass
+
+    # drift guard: SQLite result columns must match Record fields exactly
+    import results_store as _rs
+    check("results_store.RESULT_COLS == Record fields (no schema drift)",
+          list(_rs.RESULT_COLS) == [f.name for f in dataclasses.fields(Record)])
+
+
 def self_test() -> int:
     """Offline regression checks for the store-first + structured-API spine."""
     failures: list[str] = []
@@ -1629,6 +1697,7 @@ def self_test() -> int:
     _test_llm_judge(check)
     _test_record_honesty(check)
     _test_store_registry(check)
+    _test_scan(check)
 
     print(f"\n{len(failures)} failure(s)" if failures else "\nAll checks passed.")
     return 1 if failures else 0
