@@ -40,6 +40,16 @@ even when the brand's listings rank past the first page. You **Confirm** one,
 **paste** the correct store URL, or mark **Not on** that marketplace. Choices
 persist to `poc/seller_identity.json` (the store registry).
 
+### Results (price-match run)
+
+In `verify_app.py`, switch to the **Results** tab. **Finalize & run** shows a cost
+preview (products × confirmed sellers × ~calls), then runs a store-first price
+match over the **confirmed** stores in the background (progress bar). Results are
+stored in `poc/results.db` (SQLite, gitignored) and persist across restarts; the
+table filters by status/seller and **Download CSV** exports the shareable sheet.
+Storage: `results_store.py`. Engine: `confirmed_scan_plan` (free preview) +
+`scan_confirmed` (the run) in `naar_price_poc.py`.
+
 **3 · Store-first run** — only verified stores are looked up:
 ```bash
 python poc/naar_price_poc.py --backend direct --limit 15 --marketplaces amazon_in --llm-judge
