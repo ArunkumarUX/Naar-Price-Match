@@ -1214,6 +1214,29 @@ def confirmed_scan_plan(products: list, marketplaces: list) -> dict:
             "api_calls_est": len(plan) * 6, "plan": plan}
 
 
+def scan_confirmed(plan: list, adapters: dict, progress_cb=None,
+                   llm_judge: bool = False, strict: bool = False) -> list:
+    """Run a store-first price match over a confirmed-pairs plan (from
+    confirmed_scan_plan). Each item is (product, variant, marketplace, store).
+    Per-item isolation: one failure becomes a SOURCE_ERROR row, never aborts.
+    Calls progress_cb(done, total) after each item."""
+    total = len(plan)
+    records = []
+    for i, (product, variant, marketplace, store) in enumerate(plan):
+        try:
+            rec = compare_variant(product, variant, adapters[marketplace],
+                                  llm_judge, strict, store=store)
+        except Exception as e:   # defence in depth (compare_variant already guards)
+            rec = Record(product.get("_id", ""), variant.get("_id", ""),
+                         product.get("sellerId", ""), marketplace, "SOURCE_ERROR",
+                         _to_float(variant.get("sellingPrice")) or 0.0,
+                         match_evidence=f"{type(e).__name__}: {e}")
+        records.append(rec)
+        if progress_cb:
+            progress_cb(i + 1, total)
+    return records
+
+
 def run(args) -> list[Record]:
     if args.backend == "fixture":
         products = FIXTURE_NAAR
@@ -1650,7 +1673,8 @@ def _test_scan(check):
         confirm_store("sa", "amazon_in", seller_display="Alpha Store")
         # products: sa confirmed on amazon_in (1 variant) -> 1 pair; sb unconfirmed -> 0
         products = [
-            {"_id": "pa", "title": "Amla", "sellerId": "sa", "seller": {"storeName": "Alpha Store"},
+            {"_id": "pa", "title": "Amla", "description": "Pure amla powder",
+             "sellerId": "sa", "seller": {"storeName": "Alpha Store"},
              "variants": [{"_id": "va", "attributes": {"weight": "100g"}, "variantName": "100g",
                            "sellingPrice": 90.0}]},
             {"_id": "pb", "title": "Honey", "sellerId": "sb", "seller": {"storeName": "Beta"},
@@ -1661,6 +1685,30 @@ def _test_scan(check):
         check("plan skips unconfirmed sellers",
               all(item[0]["sellerId"] == "sa" for item in plan["plan"]))
         check("plan estimates api calls (>= pairs)", plan["api_calls_est"] >= plan["pairs"])
+
+        # scan_confirmed runs the plan store-first, with progress + isolation
+        class _Ok(MarketplaceAdapter):
+            name = "amazon_in"
+            def search(self, q):
+                return [Candidate("amazon_in", "L", "u", "Amla Powder 100g",
+                                  [Offer("Alpha Store", price_inr=130.0)])]
+        class _Boom(MarketplaceAdapter):
+            name = "amazon_in"
+            def search(self, q):
+                raise RuntimeError("kaboom")   # NOT SourceError -> tests isolation
+        prod = products[0]
+        var = prod["variants"][0]
+        store = _confirmed_store("sa", "amazon_in")
+        seen = []
+        recs = scan_confirmed([(prod, var, "amazon_in", store)], {"amazon_in": _Ok()},
+                              progress_cb=lambda d, t: seen.append((d, t)))
+        check("scan_confirmed MATCHES via the confirmed store",
+              len(recs) == 1 and recs[0].status == "MATCHED"
+              and recs[0].marketplace_sold_by == "Alpha Store")
+        check("progress_cb called once per pair with (done,total)", seen == [(1, 1)])
+        recs2 = scan_confirmed([(prod, var, "amazon_in", store)], {"amazon_in": _Boom()})
+        check("scan_confirmed isolates a raising pair -> SOURCE_ERROR row (no abort)",
+              len(recs2) == 1 and recs2[0].status == "SOURCE_ERROR")
     finally:
         _seller_identity_cache = None
         os.environ.pop("NAAR_KYC_FILE", None)
