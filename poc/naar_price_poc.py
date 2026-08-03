@@ -561,6 +561,11 @@ def _redact_secrets(msg: str) -> str:
 def _scraperapi_structured(kind: str, params: dict) -> dict:
     """GET a ScraperAPI structured-data endpoint (e.g. 'amazon/search',
     'amazon/product') and return parsed JSON. Honest failures -> SourceError."""
+    import scrape_cache
+    if scrape_cache.enabled():
+        _hit = scrape_cache.get(kind, params, scrape_cache.ttl())
+        if _hit is not None:
+            return _hit
     if requests is None:
         raise SourceError("requests not installed")
     key = os.environ.get("SCRAPERAPI_KEY", "").strip()
@@ -584,6 +589,8 @@ def _scraperapi_structured(kind: str, params: dict) -> dict:
         # 200 with a top-level array/scalar (providers emit these on edge/errors):
         # honest SourceError, not an AttributeError crashing the whole lookup.
         raise SourceError(f"structured body not a JSON object (got {type(body).__name__})")
+    if scrape_cache.enabled():
+        scrape_cache.put(kind, params, body)
     return body
 
 
@@ -1858,6 +1865,45 @@ def _test_auto_confirm(check):
             pass
 
 
+def _test_scrape_cache(check):
+    """A cached response is returned WITHOUT network; SCRAPE_CACHE=off bypasses it."""
+    import tempfile as _tf
+    import scrape_cache as _sc
+    saved_db = os.environ.get("SCRAPE_CACHE_DB")
+    saved_on = os.environ.get("SCRAPE_CACHE")
+    fd, dbp = _tf.mkstemp(suffix=".db")
+    os.close(fd)
+    os.environ["SCRAPE_CACHE_DB"] = dbp
+    os.environ["SCRAPE_CACHE"] = "on"
+    try:
+        fake = {"sold_by": "CACHED CO", "pricing": "₹1"}
+        _sc.put("amazon/product", {"asin": "ZCACHE"}, fake)
+        # cache hit -> returns fake, NO network (works even if requests is importable)
+        got = _scraperapi_structured("amazon/product", {"asin": "ZCACHE"})
+        check("cached structured response served without network", got == fake)
+        # bypass: with cache off and no live path available, it must NOT return the cached value
+        os.environ["SCRAPE_CACHE"] = "off"
+        bypassed = True
+        try:
+            r = _scraperapi_structured("amazon/product", {"asin": "ZCACHE"})
+            bypassed = (r != fake)        # if it somehow returns, it must not be the cached body
+        except SourceError:
+            bypassed = True               # expected: no key/requests -> live path raises
+        check("SCRAPE_CACHE=off bypasses the cache", bypassed)
+    finally:
+        os.environ.pop("SCRAPE_CACHE_DB", None)
+        os.environ.pop("SCRAPE_CACHE", None)
+        if saved_db is not None:
+            os.environ["SCRAPE_CACHE_DB"] = saved_db
+        if saved_on is not None:
+            os.environ["SCRAPE_CACHE"] = saved_on
+        for p in (dbp, dbp + "-wal", dbp + "-shm"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
 def self_test() -> int:
     """Offline regression checks for the store-first + structured-API spine."""
     failures: list[str] = []
@@ -1880,6 +1926,7 @@ def self_test() -> int:
     _test_store_registry(check)
     _test_scan(check)
     _test_auto_confirm(check)
+    _test_scrape_cache(check)
 
     print(f"\n{len(failures)} failure(s)" if failures else "\nAll checks passed.")
     return 1 if failures else 0
