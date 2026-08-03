@@ -5,3 +5,6 @@ seller_identity.json
 results.db
 results.db-wal
 results.db-shm
+scrape_cache.db
+scrape_cache.db-wal
+scrape_cache.db-shm

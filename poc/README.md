@@ -125,6 +125,15 @@ non-MATCHED row; competitor prices live in `other_sellers`.
 | `NAAR_KYC_FILE` | store-registry path (default `poc/seller_identity.json`) |
 | `MATCH_COVERAGE_FAIL` / `MATCH_COVERAGE_PASS` / `MATCH_MAX_UNEXPLAINED_RATIO` | product-gate tuning |
 
+### Scrape cache
+
+Successful ScraperAPI responses are cached in `poc/scrape_cache.db` (SQLite,
+gitignored, **disposable** — delete it to force a fresh re-scrape). Repeat
+discovery / price-match runs of the same product are then instant and cost no
+credits. Env: `SCRAPE_CACHE=off` bypasses it; `SCRAPE_CACHE_TTL` (seconds,
+default 604800 = 7 days) sets freshness; `SCRAPE_CACHE_DB` overrides the path.
+Only successful responses are cached; the cache never breaks a live fetch.
+
 ---
 
 ## Files
