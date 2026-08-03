@@ -1871,6 +1871,7 @@ def _test_scrape_cache(check):
     import scrape_cache as _sc
     saved_db = os.environ.get("SCRAPE_CACHE_DB")
     saved_on = os.environ.get("SCRAPE_CACHE")
+    saved_key = os.environ.get("SCRAPERAPI_KEY")
     fd, dbp = _tf.mkstemp(suffix=".db")
     os.close(fd)
     os.environ["SCRAPE_CACHE_DB"] = dbp
@@ -1883,20 +1884,23 @@ def _test_scrape_cache(check):
         check("cached structured response served without network", got == fake)
         # bypass: with cache off and no live path available, it must NOT return the cached value
         os.environ["SCRAPE_CACHE"] = "off"
-        bypassed = True
+        os.environ.pop("SCRAPERAPI_KEY", None)   # force the live path to fail fast, offline
+        bypassed = False
         try:
-            r = _scraperapi_structured("amazon/product", {"asin": "ZCACHE"})
-            bypassed = (r != fake)        # if it somehow returns, it must not be the cached body
+            _scraperapi_structured("amazon/product", {"asin": "ZCACHE"})
         except SourceError:
-            bypassed = True               # expected: no key/requests -> live path raises
-        check("SCRAPE_CACHE=off bypasses the cache", bypassed)
+            bypassed = True                       # cache bypassed -> live path -> no key -> raises
+        check("SCRAPE_CACHE=off bypasses the cache (offline)", bypassed)
     finally:
         os.environ.pop("SCRAPE_CACHE_DB", None)
         os.environ.pop("SCRAPE_CACHE", None)
+        os.environ.pop("SCRAPERAPI_KEY", None)
         if saved_db is not None:
             os.environ["SCRAPE_CACHE_DB"] = saved_db
         if saved_on is not None:
             os.environ["SCRAPE_CACHE"] = saved_on
+        if saved_key is not None:
+            os.environ["SCRAPERAPI_KEY"] = saved_key
         for p in (dbp, dbp + "-wal", dbp + "-shm"):
             try:
                 os.remove(p)

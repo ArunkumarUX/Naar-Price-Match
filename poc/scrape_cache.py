@@ -53,7 +53,7 @@ def get(kind: str, params: dict, ttl_seconds: int, path=None):
         with _connect(path) as conn:
             row = conn.execute("SELECT body, fetched_at FROM cache WHERE key = ?",
                                (cache_key(kind, params),)).fetchone()
-    except (sqlite3.Error, OSError):
+    except (sqlite3.Error, OSError, TypeError):
         return None                       # cache is an optimization, never a failure
     if not row:
         return None
