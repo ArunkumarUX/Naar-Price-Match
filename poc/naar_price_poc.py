@@ -372,6 +372,39 @@ def content_tokens(s: str) -> set[str]:
     return {t for t in toks if t not in STOPWORDS and not t.isdigit() and len(t) > 1}
 
 
+# Generic quality/marketing descriptors that appear on marketplace listings but do
+# NOT change product identity ("cold pressed", "100% pure", "chemical free",
+# "unrefined"). They never count as "unexplained" tokens. Curated and conservative —
+# every addition is validated by eval_accuracy staying 0-false (a word that DOES
+# change identity, e.g. "mask"/"juice", must never go here).
+DESCRIPTORS = {
+    "cold", "pressed", "wood", "stone", "pure", "chemical", "natural", "organic",
+    "premium", "fresh", "healthy", "cooking", "frying", "deep", "ideal", "traditional",
+    "homemade", "authentic", "quality", "best", "unrefined", "refined", "raw", "whole",
+    "original", "classic", "grade", "export", "nutritious", "wholesome", "handmade",
+    "artisan", "unpolished", "handpicked", "farm",
+}
+
+# Domain synonyms (Indian regional food): different words for the SAME thing, mapped
+# to one canonical token so the gate treats them as equal ("Peanut Oil" == "Groundnut
+# Oil", "Karupatti" == "Palm Jaggery"). Curated and eval-guarded.
+SYNONYMS = {
+    "peanut": "groundnut", "peanuts": "groundnut", "groundnuts": "groundnut",
+    "kadalai": "groundnut", "gingelly": "sesame", "til": "sesame", "nallennai": "sesame",
+    "karupatti": "jaggery", "panaivellam": "jaggery", "vellam": "jaggery",
+    "palmjaggery": "jaggery",
+}
+
+
+def _ident_tokens(s: str) -> set[str]:
+    """Identity-bearing tokens: content tokens with synonyms canonicalised and
+    generic descriptors dropped. Used for coverage/unexplained scoring so a
+    keyword-stuffed listing ('Cold Pressed Groundnut Oil | Peanut Oil | 100% Pure')
+    still reads as the same product, while a real derivative ('...Hair Mask') keeps
+    its identity-changing tokens."""
+    return {SYNONYMS.get(t, t) for t in content_tokens(s)} - DESCRIPTORS
+
+
 def extract_attrs(text: str) -> dict:
     """Pull comparable attributes (quantity in base units, pack count) from free text."""
     attrs: dict = {}
@@ -873,7 +906,7 @@ def product_gate(naar_product: dict, variant: dict, cand: Candidate,
 
     # How much of the Naar identity is present in the listing (coverage), and
     # how much of the listing is content Naar cannot explain (extra ratio).
-    nt, ct = content_tokens(n_text), content_tokens(cand.title)
+    nt, ct = _ident_tokens(n_text), _ident_tokens(cand.title)
     coverage = len(nt & ct) / max(1, len(nt))
     evidence.append(f"coverage={coverage:.2f}")
 
@@ -893,9 +926,9 @@ def product_gate(naar_product: dict, variant: dict, cand: Candidate,
     seller = naar_product.get("seller") or {}
     explained = (
         nt
-        | content_tokens(desc)
-        | content_tokens(str(seller.get("storeName") or ""))
-        | content_tokens(str(seller.get("businessName") or ""))
+        | _ident_tokens(desc)
+        | _ident_tokens(str(seller.get("storeName") or ""))
+        | _ident_tokens(str(seller.get("businessName") or ""))
     )
     unexplained = ct - explained
     extra_ratio = len(unexplained) / max(1, len(ct))
@@ -1518,6 +1551,27 @@ def _test_quantity_and_units(check):
                        Candidate("x", "z", "u", "Protein Bar 250g"), False)[0] in ("pass", "fail", "borderline"))
 
 
+def _test_descriptor_synonym(check):
+    """Judge-free identity resolution: generic marketing descriptors and domain
+    synonyms don't block a match, but identity-changing nouns still do."""
+    oil = {"title": "Chithirai Groundnut Oil", "description": "", "seller": {}}
+    ov = {"attributes": {}, "variantName": "1l"}
+    # keyword-stuffed marketplace title (adjectives) + peanut==groundnut synonym -> PASS
+    stuffed = Candidate("x", "1", "u",
+        "Chithirai Cold Pressed Groundnut Oil 1L | Wood Pressed Peanut Oil | 100% Pure & Chemical | Unrefined")
+    check("descriptor+synonym: keyword-stuffed same product -> pass",
+          product_gate(oil, ov, stuffed, False)[0] == "pass")
+    check("synonym: 'Peanut Oil' == 'Groundnut Oil' -> pass",
+          product_gate(oil, ov, Candidate("x", "2", "u", "Chithirai Pure Peanut Oil 1L"), False)[0] == "pass")
+    # SAFETY: an identity-changing noun ('mask') is NOT a descriptor -> never a pass
+    check("safety: descriptor rule does NOT match a derivative (Hair Mask)",
+          product_gate({"title": "Amla Powder", "description": "", "seller": {}},
+                       {"attributes": {}, "variantName": "100g"},
+                       Candidate("x", "3", "u", "Amla Powder Hair Mask 100g"), False)[0] != "pass")
+    check("_ident_tokens drops descriptors + canonicalises synonyms",
+          _ident_tokens("Cold Pressed Peanut Oil") == {"groundnut", "oil"})
+
+
 def _test_gtin(check):
     """GTIN/barcode is the strongest identity signal; codes compare equal across UPC-12/EAN-13/GTIN-14."""
     check("GTIN exact -> pass regardless of title",
@@ -1986,6 +2040,7 @@ def self_test() -> int:
 
     _test_name_matching(check)
     _test_product_gate(check)
+    _test_descriptor_synonym(check)
     _test_quantity_and_units(check)
     _test_gtin(check)
     _test_structured_api(check)
