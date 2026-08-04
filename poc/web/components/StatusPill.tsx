@@ -1,5 +1,7 @@
 const MAP: Record<string, { label: string; fg: string; bg: string }> = {
   MATCHED: { label: "Matched", fg: "var(--good)", bg: "var(--good-bg)" },
+  AMBIGUOUS_MATCH: { label: "Needs review", fg: "var(--review)", bg: "var(--review-bg)" },
+  SOLD_BY_OTHER: { label: "Other seller", fg: "var(--high)", bg: "var(--high-bg)" },
   PRODUCT_NOT_FOUND: { label: "Not found", fg: "var(--ink-3)", bg: "var(--neutral-bg)" },
   OUT_OF_STOCK: { label: "Out of stock", fg: "var(--review)", bg: "var(--review-bg)" },
   SOURCE_ERROR: { label: "Source error", fg: "var(--err)", bg: "var(--err-bg)" },
