@@ -68,9 +68,10 @@ def _all_naar_products() -> list:
     """Page through the whole Naar catalogue. The API caps at ~100 products/page,
     so a single fetch only sees page 1 (~14 sellers). The pages are independent,
     so fetch them a batch at a time CONCURRENTLY (serial paging is ~2 min; batched
-    is ~10s), retrying transient blips, until a short/empty/failed page marks the
-    end. Partial results are kept — a mid-catalogue hiccup never blanks the UI.
-    Bounded by VERIFY_LIMIT so a mis-paginating API can't run away."""
+    is ~10s), retrying transient blips. The catalogue ends only at a genuinely
+    EMPTY page — a short (partial) page or a single failed page must NOT truncate
+    the rest, or later sellers (e.g. those past a mid-catalogue hiccup) silently
+    vanish. Bounded by VERIFY_LIMIT so a mis-paginating API can't run away."""
     cap = int(os.environ.get("VERIFY_LIMIT", "5000"))
     page_size, batch = 100, 8
     out: list = []
@@ -80,13 +81,16 @@ def _all_naar_products() -> list:
             skips = [base + i * page_size for i in range(batch)]
             pages = list(ex.map(lambda sk: _fetch_page(sk, page_size), skips))
             stop = False
-            for pg in pages:                 # in skip order: keep pages up to the first end/failure
-                if pg is None or len(pg) < page_size:
-                    out.extend(pg or [])
+            got_any = False
+            for pg in pages:                 # in skip order
+                if pg is None:               # failed after retries — skip it, keep the tail
+                    continue
+                got_any = True
+                if len(pg) == 0:             # genuine end of catalogue
                     stop = True
                     break
-                out.extend(pg)
-            if stop:
+                out.extend(pg)               # keep short-but-nonempty pages too, and continue
+            if stop or not got_any:          # empty page = end; a wholly-failed batch = give up
                 break
             base += batch * page_size
     return out[:cap]

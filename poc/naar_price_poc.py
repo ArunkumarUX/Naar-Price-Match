@@ -1241,27 +1241,49 @@ def confirmed_scan_plan(products: list, marketplaces: list) -> dict:
 
 
 def scan_confirmed(plan: list, adapters: dict, progress_cb=None,
-                   llm_judge: bool = False, strict: bool = False) -> list:
+                   llm_judge: bool = False, strict: bool = False,
+                   max_workers: int = 4) -> list:
     """Run a store-first price match over a confirmed-pairs plan (from
     confirmed_scan_plan). Each item is (product, variant, marketplace, store).
     Per-item isolation: one failure becomes a SOURCE_ERROR row, never aborts.
-    Calls progress_cb(done, total) after each item."""
+    Calls progress_cb(done, total) after each item. Live adapters are stateless,
+    so pairs run CONCURRENTLY (each live lookup is ~30s of API latency — serial is
+    minutes); a FixtureAdapter is keyed per product (mutable state) so those run
+    sequentially. Results stay in plan order regardless."""
     total = len(plan)
-    records = []
-    for i, (product, variant, marketplace, store) in enumerate(plan):
+
+    def _one(item):
+        product, variant, marketplace, store = item
         adapter = adapters[marketplace]
         if hasattr(adapter, "bind"):          # FixtureAdapter is keyed per product (offline demo)
             adapter.bind(product.get("_id", ""))
         try:
-            rec = compare_variant(product, variant, adapter, llm_judge, strict, store=store)
-        except Exception as e:   # defence in depth (compare_variant already guards)
-            rec = Record(product.get("_id", ""), variant.get("_id", ""),
-                         product.get("sellerId", ""), marketplace, "SOURCE_ERROR",
-                         _to_float(variant.get("sellingPrice")) or 0.0,
-                         match_evidence=f"{type(e).__name__}: {e}")
-        records.append(rec)
-        if progress_cb:
-            progress_cb(i + 1, total)
+            return compare_variant(product, variant, adapter, llm_judge, strict, store=store)
+        except Exception as e:                # defence in depth (compare_variant already guards)
+            return Record(product.get("_id", ""), variant.get("_id", ""),
+                          product.get("sellerId", ""), marketplace, "SOURCE_ERROR",
+                          _to_float(variant.get("sellingPrice")) or 0.0,
+                          match_evidence=f"{type(e).__name__}: {e}")
+
+    # Fixture adapters mutate per-product state -> not thread-safe: run sequentially.
+    stateful = any(hasattr(a, "bind") for a in adapters.values())
+    if stateful or total <= 1 or max_workers <= 1:
+        records = []
+        for i, item in enumerate(plan):
+            records.append(_one(item))
+            if progress_cb:
+                progress_cb(i + 1, total)
+        return records
+
+    records: list = [None] * total
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, total)) as ex:
+        futs = {ex.submit(_one, item): i for i, item in enumerate(plan)}
+        for f in concurrent.futures.as_completed(futs):
+            records[futs[f]] = f.result()
+            done += 1
+            if progress_cb:
+                progress_cb(done, total)
     return records
 
 
@@ -1791,6 +1813,19 @@ def _test_scan(check):
         recs2 = scan_confirmed([(prod, var, "amazon_in", store)], {"amazon_in": _Boom()})
         check("scan_confirmed isolates a raising pair -> SOURCE_ERROR row (no abort)",
               len(recs2) == 1 and recs2[0].status == "SOURCE_ERROR")
+
+        # parallel path (stateless adapters, multi-pair): order preserved, progress
+        # reaches (total,total), and isolation still holds across threads
+        seen2: list = []
+        recs3 = scan_confirmed([(prod, var, "amazon_in", store)] * 3, {"amazon_in": _Ok()},
+                               progress_cb=lambda d, t: seen2.append((d, t)))
+        check("scan_confirmed parallel returns every pair in order (MATCHED)",
+              len(recs3) == 3 and all(r.status == "MATCHED" for r in recs3))
+        check("scan_confirmed parallel progress reaches (3,3), once per pair",
+              len(seen2) == 3 and seen2[-1] == (3, 3))
+        recs4 = scan_confirmed([(prod, var, "amazon_in", store)] * 3, {"amazon_in": _Boom()})
+        check("scan_confirmed parallel isolates raising pairs -> all SOURCE_ERROR",
+              len(recs4) == 3 and all(r.status == "SOURCE_ERROR" for r in recs4))
     finally:
         _seller_identity_cache = None
         os.environ.pop("NAAR_KYC_FILE", None)
