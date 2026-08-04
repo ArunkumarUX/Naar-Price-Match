@@ -1123,19 +1123,36 @@ def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
 
     # 1) Which candidates are the SAME product? (product gate)
     product_matched: list[tuple[Candidate, str]] = []
-    any_borderline = False
+    borderline: list[tuple[Candidate, str]] = []
     for cand in candidates:
         verdict, evidence = product_gate(product, variant, cand, llm_judge, strict)
         if verdict == "pass":
             product_matched.append((cand, evidence))
         elif verdict == "borderline":
-            any_borderline = True
+            borderline.append((cand, evidence))
 
     if not product_matched:
+        # No confident product match. If the confirmed store ITSELF lists a
+        # borderline (plausible) candidate, surface it as a REVIEW HINT — the exact
+        # product + price + link for a human to confirm. We do NOT auto-match it
+        # (that promotes derivatives the store also sells -> false matches), so the
+        # status stays AMBIGUOUS and no price is recorded — just a faster review.
+        hint_url = None
+        hint = None
+        if store is not None:
+            for cand, _ in borderline:
+                so = next((o for o in (cand.offers or []) if _offer_matches_store(o, store)), None)
+                if so is not None:
+                    hint_url = cand.listing_url
+                    price = f"₹{so.price_inr:.0f}" if so.price_inr is not None else "price n/a"
+                    who = store.get("seller_display") or "confirmed store"
+                    hint = f"{who} lists: {cand.title[:60]} @ {price} — review"
+                    break
         return Record(**base,
-                      status="AMBIGUOUS_MATCH" if any_borderline else "PRODUCT_NOT_FOUND",
+                      status="AMBIGUOUS_MATCH" if borderline else "PRODUCT_NOT_FOUND",
                       product_match_method="attribute_gate",
-                      match_evidence="borderline candidates only" if any_borderline
+                      listing_url=hint_url, other_sellers=hint,
+                      match_evidence="borderline candidates only" if borderline
                                      else "no candidate passed the product gate")
 
     # 2) Store-first split: the seller is human-verified, so a MATCH means the
@@ -1685,6 +1702,19 @@ def _test_store_registry(check):
         rec = compare_variant(prod, pv, _NoStoreStub(), False, store=store)
         check("confirmed store not selling it -> PRODUCT_NOT_FOUND + competitor intel",
               rec.status == "PRODUCT_NOT_FOUND" and "RetailNet" in (rec.other_sellers or ""))
+
+        # review hint (judge-free): a BORDERLINE candidate the confirmed store lists is
+        # surfaced (title/price/link) for fast human review — but NOT auto-matched
+        # (status stays AMBIGUOUS, no price), so derivatives can't sneak in as matches.
+        class _StoreBorderline(MarketplaceAdapter):
+            name = "amazon_in"
+            def search(self, q):
+                return [Candidate("amazon_in", "L", "https://mkt/dp/L", "Amla Powder Hair Mask 100g",
+                                  [Offer("Nivarana", price_inr=140.0)])]
+        rec = compare_variant(prod, pv, _StoreBorderline(), False, store=store)
+        check("borderline the store lists -> AMBIGUOUS + review hint + link, NO price/fake match",
+              rec.status == "AMBIGUOUS_MATCH" and rec.marketplace_selling_price is None
+              and rec.listing_url == "https://mkt/dp/L" and "Nivarana lists" in (rec.other_sellers or ""))
 
         class _ErrStub(MarketplaceAdapter):
             name = "flipkart"
