@@ -121,6 +121,10 @@ def _catalogue() -> list:
 
 
 def _adapters() -> dict:
+    # Offline demo (--fixture) must use fixture adapters, else a run hits the live
+    # network. scan_confirmed binds them per product (they're keyed by product id).
+    if USE_FIXTURE:
+        return {m: poc.FixtureAdapter(m) for m in MARKETPLACES}
     return {m: _adapter(m) for m in MARKETPLACES}
 
 

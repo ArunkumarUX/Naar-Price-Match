@@ -1249,9 +1249,11 @@ def scan_confirmed(plan: list, adapters: dict, progress_cb=None,
     total = len(plan)
     records = []
     for i, (product, variant, marketplace, store) in enumerate(plan):
+        adapter = adapters[marketplace]
+        if hasattr(adapter, "bind"):          # FixtureAdapter is keyed per product (offline demo)
+            adapter.bind(product.get("_id", ""))
         try:
-            rec = compare_variant(product, variant, adapters[marketplace],
-                                  llm_judge, strict, store=store)
+            rec = compare_variant(product, variant, adapter, llm_judge, strict, store=store)
         except Exception as e:   # defence in depth (compare_variant already guards)
             rec = Record(product.get("_id", ""), variant.get("_id", ""),
                          product.get("sellerId", ""), marketplace, "SOURCE_ERROR",
