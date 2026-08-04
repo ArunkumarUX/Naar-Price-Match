@@ -392,7 +392,18 @@ SYNONYMS = {
     "peanut": "groundnut", "peanuts": "groundnut", "groundnuts": "groundnut",
     "kadalai": "groundnut", "gingelly": "sesame", "til": "sesame", "nallennai": "sesame",
     "karupatti": "jaggery", "panaivellam": "jaggery", "vellam": "jaggery",
-    "palmjaggery": "jaggery",
+}
+
+# Form/category markers: nouns that denote a DIFFERENT product form. When one appears
+# as an UNEXPLAINED token (present on the listing but not the Naar product), it blocks
+# an auto-pass regardless of the unexplained ratio — this is what keeps "Coconut Oil"
+# from matching "Coconut HAIR Oil", or "Amla Powder" from matching "Amla Powder MASK",
+# even after descriptors are stripped. (If the marker is on the Naar side too, it's
+# explained and does not block.)
+CATEGORY_MARKERS = {
+    "hair", "mask", "serum", "cream", "gel", "lotion", "shampoo", "conditioner",
+    "soap", "scrub", "wash", "cleanser", "balm", "butter", "kit", "combo", "juice",
+    "syrup", "capsule", "capsules", "tablet", "tablets", "candle", "spray", "toner",
 }
 
 
@@ -563,7 +574,7 @@ def variant_search_text(product: dict, variant: dict) -> str:
     # Title + any variant token NOT already in the title. Appending a token the
     # title already carries ("...1L" + variant "1L" -> "...1L 1L") changes the
     # marketplace search ranking and can drop the real listing out of the top hits.
-    title = str(product.get("title", ""))
+    title = str(product.get("title") or "")   # `or ""` -> a present-but-None title becomes "", not "None"
     words = set(re.findall(r"[a-z0-9.]+", title.casefold()))
     bits = [title]
     tokens = [_useful_variant_token(variant.get("variantName") or variant.get("variantOption"))]
@@ -943,10 +954,16 @@ def product_gate(naar_product: dict, variant: dict, cand: Candidate,
     if unexplained:
         evidence.append(f"unexplained={sorted(unexplained)} ratio={extra_ratio:.2f}")
 
+    # A form/category marker present only on the listing (e.g. 'hair', 'mask') means
+    # a different product form — never an auto-pass, however low the ratio.
+    markers = unexplained & CATEGORY_MARKERS
+    if markers:
+        evidence.append(f"category_marker={sorted(markers)}")
+
     # Default 0.45 sits above verbose-but-exact listings and below derivative
     # products; --strict tightens it. Tunable via MATCH_MAX_UNEXPLAINED_RATIO.
     max_extra = _cfg_float("MATCH_MAX_UNEXPLAINED_RATIO", 0.30 if strict else 0.45)
-    if coverage >= cov_pass and extra_ratio <= max_extra:
+    if coverage >= cov_pass and extra_ratio <= max_extra and not markers:
         return "pass", "; ".join(evidence)
 
     if llm_judge:
@@ -1576,8 +1593,16 @@ def _test_descriptor_synonym(check):
           product_gate({"title": "Amla Powder", "description": "", "seller": {}},
                        {"attributes": {}, "variantName": "100g"},
                        Candidate("x", "3", "u", "Amla Powder Hair Mask 100g"), False)[0] != "pass")
+    # a form/category marker ('hair') present only on the listing blocks the pass even
+    # when descriptors are stripped and the ratio is low (Coconut Oil != Coconut Hair Oil)
+    check("category marker: 'Coconut Oil' does NOT match 'Coconut Hair Oil'",
+          product_gate({"title": "Cold Pressed Coconut Oil", "description": "", "seller": {}},
+                       {"attributes": {}, "variantName": "-"},
+                       Candidate("x", "4", "u", "Pure Coconut Hair Oil"), False)[0] != "pass")
     check("_ident_tokens drops descriptors + canonicalises synonyms",
           _ident_tokens("Cold Pressed Peanut Oil") == {"groundnut", "oil"})
+    check("variant_search_text: a present-but-None title never leaks 'None'",
+          variant_search_text({"title": None}, {"attributes": {}, "variantName": "500ml"}) == "500ml")
 
 
 def _test_gtin(check):

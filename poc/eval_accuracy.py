@@ -85,6 +85,15 @@ add("p3", p, v, C("Amla Juice 1L",
                   [Offer("TREASURE FLAVOURS", None, 300.0)]),
     "AMBIGUOUS_MATCH", False, "different form (juice vs powder), shares 'amla' — gate abstains, judge rejects")
 
+# descriptor-stripping must NOT let a form-marker derivative through (Coconut Oil vs
+# Coconut HAIR Oil, same seller) — the category-marker guard keeps it out.
+poil, voil = prod("Cold Pressed Coconut Oil", "Pure cold pressed coconut cooking oil.",
+                  "TREASURE FLAVOURS", "TREASURE FLAVOURS FOODS PRIVATE LIMITED", "500ml",
+                  {"weight": "500ml"}, price=250.0)
+add("p4", poil, voil, C("Pure Coconut Hair Oil 500ml",
+                  [Offer("TREASURE FLAVOURS", None, 240.0)]),
+    "AMBIGUOUS_MATCH", False, "cooking oil vs HAIR oil, same seller — category marker blocks the pass")
+
 # --- QUANTITY / VARIANT MISMATCH -> product fail ---
 add("q1", p, v, C("Pure Amla Powder 250g",
                   [Offer("TREASURE FLAVOURS", None, 300.0)]),
