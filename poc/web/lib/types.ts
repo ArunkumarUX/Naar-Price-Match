@@ -40,6 +40,7 @@ export interface ResultRow {
   naar_selling_price: number | null;
   marketplace_selling_price: number | null;
   marketplace_unit_price: number | null;
+  qty_ratio: number | null;
   marketplace_sold_by: string | null;
   other_sellers: string | null;
   listing_url: string | null;

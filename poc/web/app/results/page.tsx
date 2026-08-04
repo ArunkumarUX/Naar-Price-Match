@@ -88,7 +88,14 @@ export default function ResultsPage() {
                     </td>
                     <td className="px-4 py-3 text-xs capitalize" style={{ color: "var(--ink-3)" }}>{r.marketplace.replace("_in", "")}</td>
                     <td className="px-4 py-3 text-right tnum font-semibold">{rupees(r.naar_selling_price)}</td>
-                    <td className="px-4 py-3 text-right tnum font-semibold">{rupees(mkt)}</td>
+                    <td className="px-4 py-3 text-right">
+                      <div className="tnum font-semibold">{rupees(mkt)}</div>
+                      {r.qty_ratio != null && Math.abs(r.qty_ratio - 1) > 0.001 && r.marketplace_selling_price != null && (
+                        <div className="tnum text-xs" style={{ color: "var(--ink-3)" }}>
+                          {rupees(r.marketplace_selling_price)} · {Number(r.qty_ratio.toFixed(3))}×/unit
+                        </div>
+                      )}
+                    </td>
                     <td className="px-4 py-3 text-right tnum font-bold"
                         style={{ color: d == null ? "var(--ink-3)" : d > 0 ? "var(--good)" : "var(--high)" }}>
                       {deltaText(d)}
