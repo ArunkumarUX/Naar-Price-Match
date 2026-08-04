@@ -560,16 +560,19 @@ def variant_attr_pairs(variant: dict) -> list[tuple[str, str]]:
 
 
 def variant_search_text(product: dict, variant: dict) -> str:
-    bits = [product.get("title", "")]
-    vn = _useful_variant_token(
-        variant.get("variantName") or variant.get("variantOption"))
-    if vn:
-        bits.append(vn)
-    for _k, v in variant_attr_pairs(variant):
-        tok = _useful_variant_token(v)
-        if tok:
+    # Title + any variant token NOT already in the title. Appending a token the
+    # title already carries ("...1L" + variant "1L" -> "...1L 1L") changes the
+    # marketplace search ranking and can drop the real listing out of the top hits.
+    title = str(product.get("title", ""))
+    words = set(re.findall(r"[a-z0-9.]+", title.casefold()))
+    bits = [title]
+    tokens = [_useful_variant_token(variant.get("variantName") or variant.get("variantOption"))]
+    tokens += [_useful_variant_token(v) for _k, v in variant_attr_pairs(variant)]
+    for tok in tokens:
+        if tok and tok.casefold() not in words:
             bits.append(tok)
-    return " ".join(str(b) for b in bits if b).strip()
+            words.add(tok.casefold())
+    return " ".join(b for b in bits if b).strip()
 
 
 # --------------------------------------------------------------------------
