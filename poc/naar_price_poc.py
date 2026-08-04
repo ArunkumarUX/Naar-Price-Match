@@ -668,8 +668,13 @@ class AmazonInAdapter(MarketplaceAdapter):
     name = "amazon_in"
 
     def search(self, query: str) -> list[Candidate]:
+        # The confirmed store's own listing often ranks just past the first few
+        # results (e.g. rank 6), so a top-5 cap silently misses real matches. Scan
+        # deeper (env MATCH_SEARCH_LIMIT, default 12); the per-candidate fetches run
+        # concurrently so the extra depth stays fast.
+        limit = int(os.environ.get("MATCH_SEARCH_LIMIT", "12"))
         cands = _amazon_structured_candidates(
-            _scraperapi_structured("amazon/search", {"query": query}), self.name)
+            _scraperapi_structured("amazon/search", {"query": query}), self.name, limit=limit)
 
         def _fill(c):   # per-candidate product lookup (independent -> run concurrently)
             try:
@@ -678,7 +683,7 @@ class AmazonInAdapter(MarketplaceAdapter):
             except SourceError as e:
                 c.offers, c.offers_error = [], str(e)
         if cands:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(5, len(cands))) as ex:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(cands))) as ex:
                 list(ex.map(_fill, cands))
         return cands
 
