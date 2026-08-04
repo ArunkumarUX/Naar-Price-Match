@@ -58,10 +58,10 @@ export default function ResultsPage() {
 
       <div className="overflow-hidden rounded-brand border" style={{ borderColor: "var(--line)", background: "var(--panel)" }}>
         <div className="overflow-x-auto">
-          <table className="w-full border-collapse" style={{ minWidth: 860 }}>
+          <table className="w-full border-collapse" style={{ minWidth: 940 }}>
             <thead>
               <tr>
-                {["Seller", "Product", "Market", "Naar ₹", "Market ₹", "Δ vs Naar", "Status", "Sold by", "Also sold by"].map((h, i) => (
+                {["Seller", "Product", "Market", "Naar ₹", "Market ₹", "Δ vs Naar", "Status", "Sold by", "Also sold by", "Link"].map((h, i) => (
                   <th key={h} className={`px-4 py-3 text-[11px] font-semibold uppercase tracking-wider ${i >= 3 && i <= 5 ? "text-right" : "text-left"}`}
                       style={{ color: "var(--ink-3)", background: "var(--panel-2)", borderBottom: "1px solid var(--line)", whiteSpace: "nowrap" }}>
                     {h}
@@ -71,10 +71,10 @@ export default function ResultsPage() {
             </thead>
             <tbody>
               {q.isError && (
-                <tr><td colSpan={9} className="px-4 py-10 text-center" style={{ color: "var(--ink-3)" }}>{(q.error as Error).message}</td></tr>
+                <tr><td colSpan={10} className="px-4 py-10 text-center" style={{ color: "var(--ink-3)" }}>{(q.error as Error).message}</td></tr>
               )}
               {!q.isError && rows.length === 0 && (
-                <tr><td colSpan={9} className="px-4 py-10 text-center" style={{ color: "var(--ink-3)" }}>no results yet — run a price match</td></tr>
+                <tr><td colSpan={10} className="px-4 py-10 text-center" style={{ color: "var(--ink-3)" }}>no results yet — run a price match</td></tr>
               )}
               {rows.map((r, i) => {
                 const d = delta(r);
@@ -96,6 +96,22 @@ export default function ResultsPage() {
                     <td className="px-4 py-3"><StatusPill status={r.status} /></td>
                     <td className="px-4 py-3">{r.marketplace_sold_by || <span style={{ color: "var(--ink-3)" }}>—</span>}</td>
                     <td className="px-4 py-3 text-xs" style={{ color: "var(--ink-3)", maxWidth: 200 }}>{r.other_sellers || "—"}</td>
+                    <td className="px-4 py-3 whitespace-nowrap">
+                      {(() => {
+                        // Matched/out-of-stock/error with a real listing -> the product page.
+                        // Otherwise (needs review / not found) -> a marketplace SEARCH so the
+                        // human can review the candidates in one click.
+                        const isProduct = !!r.listing_url;
+                        const href = r.listing_url ||
+                          `https://www.amazon.in/s?k=${encodeURIComponent(r.naar_product_title || "")}`;
+                        return (
+                          <a href={href} target="_blank" rel="noreferrer"
+                             className="text-xs font-semibold" style={{ color: "var(--accent, #00B3C2)" }}>
+                            {isProduct ? "View ↗" : "Review ↗"}
+                          </a>
+                        );
+                      })()}
+                    </td>
                   </tr>
                 );
               })}
