@@ -5,18 +5,36 @@ import { api } from "@/lib/api";
 import type { JobStatus, ResultRow } from "@/lib/types";
 import { rupees } from "@/lib/format";
 
-// Fixed marketplace columns (per the agreed layout). Only amazon_in has live data
-// today; the others render "not available" until a provider is wired.
-const COLS: { key: string; label: string }[] = [
+// Known marketplace columns, in display order. We only RENDER the ones that have
+// live data in the current results (today: Amazon via ScraperAPI structured). The
+// others stay hidden until a real provider is wired, rather than showing dead
+// "not available" columns. A new marketplace auto-appears once its rows arrive.
+const KNOWN_COLS: { key: string; label: string }[] = [
   { key: "amazon_in", label: "Amazon" },
   { key: "flipkart", label: "Flipkart" },
   { key: "meesho", label: "Meesho" },
   { key: "noon", label: "Noon" },
 ];
 
-type Cell = { price: number; pct: number | null } | null;
+/** Columns to show: marketplaces present (with a priced cell) in the data, else Amazon. */
+function visibleCols(rows: ResultRow[]): { key: string; label: string }[] {
+  const present = new Set<string>();
+  for (const r of rows) {
+    if (r.status === "MATCHED" && (r.marketplace_unit_price ?? r.marketplace_selling_price) != null) {
+      present.add(r.marketplace);
+    }
+  }
+  const shown = KNOWN_COLS.filter((c) => present.has(c.key));
+  return shown.length ? shown : [KNOWN_COLS[0]]; // always keep Amazon as the anchor column
+}
+
+type Cell = { price: number; pct: number | null; checkPack: boolean } | null;
 interface ProductRow { product: string; variant: string; naar: number | null; cells: Record<string, Cell>; }
 interface SellerGroup { seller: string; products: ProductRow[]; markets: Set<string>; }
+
+// A gap this large is usually a pack/size mismatch (e.g. a 2-pack matched to a
+// single), not a real price difference — flag it for a human to check the item count.
+const BIG_GAP_PCT = 35;
 
 /** A priced cell exists only where we have a confirmed marketplace price (MATCHED). */
 function cellFor(r: ResultRow): Cell {
@@ -24,7 +42,10 @@ function cellFor(r: ResultRow): Cell {
   const price = r.marketplace_unit_price ?? r.marketplace_selling_price;
   if (price == null) return null;
   const pct = r.naar_selling_price ? ((price - r.naar_selling_price) / r.naar_selling_price) * 100 : null;
-  return { price, pct };
+  // qty_ratio == null means the pack/size wasn't comparable; a big gap on top of
+  // that is almost certainly a differing item count, not a genuine price gap.
+  const checkPack = pct != null && Math.abs(pct) >= BIG_GAP_PCT && r.qty_ratio == null;
+  return { price, pct, checkPack };
 }
 
 function group(rows: ResultRow[]): SellerGroup[] {
@@ -43,7 +64,17 @@ function group(rows: ResultRow[]): SellerGroup[] {
     const cell = cellFor(r);
     if (cell) { pr.cells[r.marketplace] = cell; sg.markets.add(r.marketplace); }
   }
-  return [...bySeller.values()].sort((a, b) => a.seller.localeCompare(b.seller));
+  // Findings-first: within a seller, products with priced cells come first
+  // (more markets = higher), then unpriced ones alphabetically. Sellers ranked
+  // by how many of their products actually have a finding, then by name.
+  const cmp = (a: string | null | undefined, b: string | null | undefined) =>
+    String(a ?? "").localeCompare(String(b ?? ""));
+  const priced = (p: ProductRow) => Object.keys(p.cells).length;
+  for (const sg of bySeller.values()) {
+    sg.products.sort((a, b) => priced(b) - priced(a) || cmp(a.product, b.product));
+  }
+  const found = (sg: SellerGroup) => sg.products.filter((p) => priced(p) > 0).length;
+  return [...bySeller.values()].sort((a, b) => found(b) - found(a) || cmp(a.seller, b.seller));
 }
 
 export default function ResultsPage() {
@@ -59,11 +90,12 @@ export default function ResultsPage() {
   const run = query.data?.run ?? null;
   const refresh = () => qc.invalidateQueries({ queryKey: ["results-all"] });
 
+  const cols = useMemo(() => visibleCols(rows), [rows]);
   const groups = useMemo(() => {
     const g = group(rows);
     const f = q.trim().toLowerCase();
-    return f ? g.filter((s) => s.seller.toLowerCase().includes(f) ||
-      s.products.some((p) => p.product.toLowerCase().includes(f))) : g;
+    const has = (v: string | null | undefined) => String(v ?? "").toLowerCase().includes(f);
+    return f ? g.filter((s) => has(s.seller) || s.products.some((p) => has(p.product))) : g;
   }, [rows, q]);
 
   return (
@@ -95,7 +127,7 @@ export default function ResultsPage() {
                     style={{ color: "var(--ink-3)", background: "var(--panel-2)", borderBottom: "1px solid var(--line)", whiteSpace: "nowrap" }}>
                   Naar ₹
                 </th>
-                {COLS.map((c) => (
+                {cols.map((c) => (
                   <th key={c.key} className="px-4 py-3 text-right text-[11px] font-semibold uppercase tracking-wider"
                       style={{ color: "var(--ink-3)", background: "var(--panel-2)", borderBottom: "1px solid var(--line)", whiteSpace: "nowrap" }}>
                     {c.label}
@@ -105,12 +137,12 @@ export default function ResultsPage() {
             </thead>
             <tbody>
               {query.isError && (
-                <tr><td colSpan={2 + COLS.length} className="px-4 py-10 text-center" style={{ color: "var(--ink-3)" }}>{(query.error as Error).message}</td></tr>
+                <tr><td colSpan={2 + cols.length} className="px-4 py-10 text-center" style={{ color: "var(--ink-3)" }}>{(query.error as Error).message}</td></tr>
               )}
               {!query.isError && groups.length === 0 && (
-                <tr><td colSpan={2 + COLS.length} className="px-4 py-10 text-center" style={{ color: "var(--ink-3)" }}>no results yet — run a price match</td></tr>
+                <tr><td colSpan={2 + cols.length} className="px-4 py-10 text-center" style={{ color: "var(--ink-3)" }}>no results yet — run a price match</td></tr>
               )}
-              {groups.map((sg) => <SellerBlock key={sg.seller} group={sg} />)}
+              {groups.map((sg) => <SellerBlock key={sg.seller} group={sg} cols={cols} />)}
             </tbody>
           </table>
         </div>
@@ -124,14 +156,14 @@ export default function ResultsPage() {
   );
 }
 
-function SellerBlock({ group }: { group: SellerGroup }) {
+function SellerBlock({ group, cols }: { group: SellerGroup; cols: { key: string; label: string }[] }) {
   const [open, setOpen] = useState(true);
   const priced = group.products.filter((p) => Object.keys(p.cells).length > 0).length;
-  const marketLabels = COLS.filter((c) => group.markets.has(c.key)).map((c) => c.label);
+  const marketLabels = cols.filter((c) => group.markets.has(c.key)).map((c) => c.label);
   return (
     <>
       <tr style={{ borderBottom: "1px solid var(--line)", cursor: "pointer" }} onClick={() => setOpen(!open)}>
-        <td className="px-4 py-3" colSpan={2 + COLS.length} style={{ background: "var(--panel-2)" }}>
+        <td className="px-4 py-3" colSpan={2 + cols.length} style={{ background: "var(--panel-2)" }}>
           <div className="flex items-center gap-2">
             <span style={{ color: "var(--ink-3)", width: 14, display: "inline-block" }}>{open ? "▾" : "▸"}</span>
             <span className="font-semibold">{group.seller}</span>
@@ -149,14 +181,19 @@ function SellerBlock({ group }: { group: SellerGroup }) {
             {p.variant && p.variant !== "-" && <div className="text-xs" style={{ color: "var(--ink-3)" }}>{p.variant}</div>}
           </td>
           <td className="px-4 py-3 text-right tnum font-semibold">{rupees(p.naar)}</td>
-          {COLS.map((c) => {
+          {cols.map((c) => {
             const cell = p.cells[c.key];
             if (!cell) return <td key={c.key} className="px-4 py-3 text-right text-xs" style={{ color: "var(--ink-3)" }}>not available</td>;
             const good = cell.pct != null && cell.pct > 0; // marketplace pricier => Naar cheaper
             return (
               <td key={c.key} className="px-4 py-3 text-right">
                 <div className="tnum font-semibold">{rupees(cell.price)}</div>
-                {cell.pct != null && (
+                {cell.checkPack ? (
+                  <div className="text-xs" style={{ color: "var(--ink-3)" }}
+                       title="Large gap and the pack/size wasn't comparable — likely a differing item count (e.g. a 2-pack matched to a single). Verify quantity.">
+                    ⚠ check pack/size
+                  </div>
+                ) : cell.pct != null && (
                   <div className="tnum text-xs" style={{ color: good ? "var(--good)" : "var(--high)" }}>
                     {cell.pct > 0 ? "+" : ""}{cell.pct.toFixed(0)}%
                   </div>
@@ -192,7 +229,15 @@ function RunPanel({ onDone }: { onDone: () => void }) {
       else { setPhase(st.status === "error" ? "error" : "done"); setMsg(st.error || ""); onDone(); }
     }, 1500);
   }
-  async function openPreview() { setPhase("preview"); setPreview(await api.runPreview()); }
+  async function openPreview() {
+    setPhase("preview");
+    setPreview(null);
+    // The first preview loads the whole catalogue (slow, sometimes flaky) — without
+    // a loading state the panel would render blank, and without a catch a failure
+    // would leave it stuck blank. Handle both so the control never just vanishes.
+    try { setPreview(await api.runPreview()); }
+    catch (e) { setPhase("error"); setMsg((e as Error).message || "preview failed"); }
+  }
   async function run() {
     try { await api.run(); setPhase("running"); poll(); }
     catch (e) { setPhase("error"); setMsg((e as Error).message); }
@@ -204,6 +249,9 @@ function RunPanel({ onDone }: { onDone: () => void }) {
         <button className="rounded-pill px-3.5 py-1.5 text-sm font-bold" style={{ background: "#00B3C2", color: "#02201f" }} onClick={openPreview}>
           Finalize &amp; run price match
         </button>
+      )}
+      {phase === "preview" && !preview && (
+        <div className="text-sm" style={{ color: "var(--ink-3)" }}>loading run preview…</div>
       )}
       {phase === "preview" && preview && (
         <div className="text-sm">

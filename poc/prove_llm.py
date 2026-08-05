@@ -100,9 +100,12 @@ check("openai path: HTTP 500 -> None (never fabricates)",
       poc._llm_same_product("A", "B") is None)
 STATE.update(code=200)
 
-# 6. The judge actually FLIPS product_gate on a real borderline pair.
+# 6. The judge FLIPS product_gate on a real borderline pair. The pair must be a
+# keyword-stuffed SAME-base product with NO category marker — a marker derivative
+# ("Amla Powder Hair Mask") is a HARD fail the judge must never even see (safety).
 amla = poc.FIXTURE_NAAR[0]
-borderline = poc.Candidate("x", "Y", "u", "Amla Powder Hair Mask 100g")
+borderline = poc.Candidate("x", "Y", "u",
+                           "Amla Powder Extract Blend Immunity Wellness Daily Combo Value 100g")
 v_nojudge, _ = poc.product_gate(amla, amla["variants"][0], borderline, llm_judge=False)
 check("borderline pair is 'borderline' without a judge", v_nojudge == "borderline")
 STATE.update(content='{"same_product": true}')
@@ -112,12 +115,20 @@ STATE.update(content='{"same_product": false}')
 v_false, _ = poc.product_gate(amla, amla["variants"][0], borderline, llm_judge=True)
 check("judge=false demotes borderline -> fail", v_false == "fail")
 
+# 6b. Safety: a category-marker derivative HARD-fails and is NEVER judge-eligible,
+# even if the (mocked) judge would say "same".
+marker_cand = poc.Candidate("x", "Z", "u", "Amla Powder Hair Mask 100g")
+STATE.update(content='{"same_product": true}')
+v_marker, _ = poc.product_gate(amla, amla["variants"][0], marker_cand, llm_judge=True)
+check("category-marker derivative hard-fails, judge cannot promote it", v_marker == "fail")
+
 # 7. End-to-end: the LLM verdict changes the final Record status.
 class BorderlineStub(poc.MarketplaceAdapter):
     name = "amazon_in"
     def search(self, q):
         return [poc.Candidate(
-            "amazon_in", "C1", "u1", "Amla Powder Hair Mask 100g",
+            "amazon_in", "C1", "u1",
+            "Amla Powder Extract Blend Immunity Wellness Daily Combo Value 100g",
             [poc.Offer("Treasure Flavours", None, 199.0, offer_ref="C1:o")])]
 
 # store-first: the seller ("Treasure Flavours") is the human-confirmed store.

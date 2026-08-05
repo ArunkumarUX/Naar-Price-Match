@@ -138,7 +138,11 @@ def _run_scan_job(plan) -> None:
         def progress(done, total):
             with _job_lock:
                 _job["done"], _job["total"] = done, total
-        records = poc.scan_confirmed(plan, _adapters(), progress_cb=progress)
+        # Enable the store-scoped LLM borderline-judge automatically when a provider
+        # key is configured (Anthropic/OpenAI-compatible). It only adjudicates
+        # borderline candidates sold by the confirmed store; no key -> deterministic.
+        use_llm = bool(poc._judge_provider())
+        records = poc.scan_confirmed(plan, _adapters(), progress_cb=progress, llm_judge=use_llm)
         rows = [__import__("dataclasses").asdict(r) for r in records]
         n_sellers = len({r.get("naar_seller_id") for r in rows})
         n_products = len({r.get("naar_product_id") for r in rows})
@@ -292,7 +296,7 @@ async function verify(sid,m){
    const info=document.createElement('div');
    info.innerHTML=`${esc(c.seller_display)} <span class=muted>(sim ${esc(String(c.similarity))})<br>e.g. ${esc((c.sample_title||'').slice(0,54))} ${c.sample_listing?`· <a href="${esc(c.sample_listing)}" target=_blank>listing</a>`:''}</span>`;
    const btn=document.createElement('button');btn.className='primary';btn.textContent='Confirm';
-   btn.onclick=()=>confirmStore(sid,m,c.store_url||"",c.seller_display);   // closure: real values, no HTML-attr injection
+   btn.onclick=()=>confirmStore(sid,m,c.store_url||"",c.seller_display,c.amazon_brand||"");   // closure: real values, no HTML-attr injection
    row.appendChild(info);row.appendChild(btn);box.appendChild(row);
  }
  const urow=document.createElement('div');urow.className='cand';
@@ -300,8 +304,8 @@ async function verify(sid,m){
  const ubtn=document.createElement('button');ubtn.textContent='Confirm URL';ubtn.onclick=()=>confirmUrl(sid,m);
  urow.appendChild(inp);urow.appendChild(ubtn);box.appendChild(urow);
 }
-async function confirmStore(sid,m,url,disp){
- await j('/api/confirm',{method:'POST',body:JSON.stringify({seller_id:sid,marketplace:m,store_url:url,seller_display:disp})});load();}
+async function confirmStore(sid,m,url,disp,brand){
+ await j('/api/confirm',{method:'POST',body:JSON.stringify({seller_id:sid,marketplace:m,store_url:url,seller_display:disp,amazon_brand:brand||""})});load();}
 async function confirmUrl(sid,m){
  const url=document.getElementById(`u_${sid}_${m}`).value.trim();if(!url)return;
  // Also carry the Naar store name: Amazon's structured API matches offers by the
@@ -573,7 +577,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, json.dumps({"started": True, "total": len(plan["plan"])}))
             if u.path == "/api/confirm":
                 poc.confirm_store(body["seller_id"], body["marketplace"],
-                                  body.get("store_url", ""), body.get("seller_display", ""))
+                                  body.get("store_url", ""), body.get("seller_display", ""),
+                                  amazon_brand=body.get("amazon_brand", ""))
                 return self._send(200, json.dumps({"ok": True}))
             if u.path == "/api/reject":
                 poc.reject_store(body["seller_id"], body["marketplace"])
