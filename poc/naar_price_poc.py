@@ -91,6 +91,7 @@ class Candidate:
     offers: list[Offer] = field(default_factory=list)
     offers_error: Optional[str] = None     # set when offer enumeration failed (fix 6)
     gtin: Optional[str] = None             # barcode (GTIN/EAN/UPC) from the listing, if exposed
+    bullets: str = ""                      # feature-bullet text, richer context for the LLM judge
 
 
 @dataclass
@@ -716,6 +717,23 @@ def _amazon_structured_candidates(search_json: dict, marketplace: str, limit: in
     return out
 
 
+def _bullets_text(product_json: dict, cap: int = 320) -> str:
+    """Short feature-bullet / description snippet from an amazon/product JSON, to give
+    the LLM judge more signal than a keyword-stuffed title alone. Bounded so the judge
+    prompt stays small. Pure/testable."""
+    fb = product_json.get("feature_bullets")
+    parts: list[str] = []
+    if isinstance(fb, list):
+        parts = [str(x).strip() for x in fb if str(x).strip()]
+    elif isinstance(fb, str) and fb.strip():
+        parts = [fb.strip()]
+    text = " • ".join(parts)
+    if not text:
+        text = str(product_json.get("full_description") or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text[:cap]
+
+
 def _amazon_structured_offer(product_json: dict, asin: str) -> Offer:
     """Parse the structured amazon/product JSON into an Offer (price + seller +
     MRP + stock), directly — no HTML. Pure/testable."""
@@ -747,6 +765,7 @@ class AmazonInAdapter(MarketplaceAdapter):
             try:
                 d = _scraperapi_structured("amazon/product", {"asin": c.listing_id})
                 c.offers = [_amazon_structured_offer(d, c.listing_id)]
+                c.bullets = _bullets_text(d)
             except SourceError as e:
                 c.offers, c.offers_error = [], str(e)
         if cands:
@@ -1337,7 +1356,10 @@ def compare_variant(product: dict, variant: dict, adapter: MarketplaceAdapter,
         for cand, ev in borderline:
             if not any(_offer_matches_store(o, store) for o in (cand.offers or [])):
                 continue                     # only judge the confirmed seller's OWN listings
-            res = _llm_judge_conf(naar_text, cand.title)
+            # Give the judge the listing's feature bullets, not just its (often
+            # keyword-stuffed) title — richer signal for the same-product decision.
+            listing_text = cand.title + (f" | {cand.bullets}" if cand.bullets else "")
+            res = _llm_judge_conf(naar_text, listing_text)
             if res is None:
                 continue                     # judge unavailable -> leave as a review hint
             same, conf, qratio = res
@@ -2058,6 +2080,32 @@ def _test_llm_store_scoped(check):
         check("pack heuristic alone resolves 2X vs 1L -> ratio 0.5 (per-unit 898)",
               recq3.qty_ratio is not None and abs(recq3.qty_ratio - 0.5) < 1e-6
               and abs((recq3.marketplace_unit_price or 0) - 898.0) < 1e-6)
+    finally:
+        mod._llm_judge_conf = orig
+
+    # --- richer LLM context: feature bullets are parsed and reach the judge ---
+    check("_bullets_text joins feature_bullets, bounded",
+          _bullets_text({"feature_bullets": ["Cold pressed", "1 Litre", "Sesame oil"]}) == "Cold pressed • 1 Litre • Sesame oil")
+    check("_bullets_text falls back to full_description",
+          _bullets_text({"full_description": "Pure gingelly oil"}) == "Pure gingelly oil")
+    check("_bullets_text empty -> ''", _bullets_text({}) == "")
+    seen = {}
+    def _cap(a, b):
+        seen["listing"] = b
+        return (True, 0.9, None)
+
+    class AdB(MarketplaceAdapter):
+        name = "amazon_in"
+        def search(self, q):
+            c = Candidate("amazon_in", "LB", "http://x", stuffed)
+            c.bullets = "Cold pressed gingelly (sesame) oil, 1 Litre, wood pressed"
+            c.offers = [Offer("Alpha Store", price_inr=250.0, in_stock=True)]
+            return [c]
+    mod._llm_judge_conf = _cap
+    try:
+        compare_variant(prod, var, AdB(), llm_judge=True, store=store)
+        check("judge receives the listing's feature bullets, not just the title",
+              "listing" in seen and "wood pressed" in seen["listing"] and stuffed[:10] in seen["listing"])
     finally:
         mod._llm_judge_conf = orig
 
