@@ -1,0 +1,13 @@
+{
+  "_comment": "Naar seller KYC map — confirm a seller on a marketplace even under a DIFFERENT store/brand name, and skip marketplaces they're not on. Naar already holds gstin + legal entity from seller onboarding/KYC, so this is a DB export, not manual lookup. Copy to seller_identity.json (gitignored) or point NAAR_KYC_FILE at your export. Keyed by Naar sellerId. All fields optional; strongest signal wins (GTIN/GSTIN > store URL > legal name). 'not_on' lets the pipeline skip marketplaces a seller isn't on (no wasted fetch).",
+  "ns_example_seller_id": {
+    "businessName": "REGISTERED LEGAL NAME PRIVATE LIMITED",
+    "gstin": "33ABCDE1234F1Z5",
+    "brand": "TheirBrand",
+    "pincode": "600001",
+    "amazon_url": "https://www.amazon.in/sp?seller=A1B2C3D4E5XYZ",
+    "flipkart_url": "https://www.flipkart.com/seller/xxxxx",
+    "meesho_url": "https://www.meesho.com/shop/their-store-slug",
+    "not_on": ["meesho"]
+  }
+}
